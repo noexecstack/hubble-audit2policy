@@ -2,7 +2,7 @@
 
 Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/) YAML from [Hubble](https://github.com/cilium/hubble) flow logs.
 
-Parses Hubble JSON flow logs (JSONL or JSON array) and produces per-workload CiliumNetworkPolicy files with ingress and egress rules derived from observed traffic. Supports offline file-based generation and a live watch mode with an interactive TUI.
+Built for platform engineers, SREs, and security engineers who need to bootstrap or audit Kubernetes network policies from real observed traffic rather than guessing. Parses Hubble JSON flow logs (JSONL or JSON array) and produces per-workload CiliumNetworkPolicy files with ingress and egress rules. Supports offline file-based generation and a live watch mode with an interactive TUI.
 
 ## Installation
 
