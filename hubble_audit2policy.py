@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -26,20 +26,31 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict, deque
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
-from typing import IO, Any, Generator, Iterator, cast
+from typing import IO, Any, cast
 
 import yaml
 
 LOG = logging.getLogger("hubble-audit2policy")
 
 # Type aliases for readability.
-RuleTuple = tuple[str, str, int, str]          # (ns, app, port, proto)
-RuleSet = dict[str, set[RuleTuple]]            # {"egress": {...}, "ingress": {...}}
-PolicyKey = tuple[str, str]                    # (namespace, app)
+RuleTuple = tuple[str, str, int, str]  # (ns, app, port, proto)
+RuleSet = dict[str, set[RuleTuple]]  # {"egress": {...}, "ingress": {...}}
+PolicyKey = tuple[str, str]  # (namespace, app)
 FlowKey = tuple[str, str, str, str, int, str]  # (src_ns, src_app, dst_ns, dst_app, port, proto)
-EndpointLabelCache = dict[tuple[str, str], list[str]]   # (ns, pod) -> security labels
-WorkloadLabels = dict[PolicyKey, dict[str, str]]        # (ns, app) -> matchLabels
+EndpointLabelCache = dict[tuple[str, str], list[str]]  # (ns, pod) -> security labels
+WorkloadLabels = dict[PolicyKey, dict[str, str]]  # (ns, app) -> matchLabels
+AppPods = dict[PolicyKey, set[tuple[str, str]]]  # (ns, app) -> {(ns, pod)}
+
+# Return type shared by parse_flows() and _parse_flow_list().
+ParseResult = tuple[
+    dict[PolicyKey, RuleSet],
+    Counter[FlowKey],
+    int,
+    int,
+    AppPods,
+]
 
 # Exit codes
 EXIT_OK = 0
@@ -75,6 +86,7 @@ _EXCLUDED_LABEL_PREFIXES = (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def sanitize_name(value: str | None) -> str:
     """Return a filename-safe version of *value* (alphanumeric, hyphens, dots)."""
     return re.sub(r"[^a-zA-Z0-9\-.]", "", value or "")
@@ -88,7 +100,7 @@ def _parse_identity_label(labels: list[str] | None, label_keys: list[str]) -> st
     """
     for key in label_keys:
         prefix = key + "="
-        for label in (labels or []):
+        for label in labels or []:
             if label.startswith(prefix):
                 return label.split("=", 1)[1]
     return None
@@ -96,7 +108,7 @@ def _parse_identity_label(labels: list[str] | None, label_keys: list[str]) -> st
 
 def _parse_reserved_identity(labels: list[str] | None) -> str | None:
     """Return the Cilium entity name if *labels* contain a reserved identity."""
-    for label in (labels or []):
+    for label in labels or []:
         if label in RESERVED_IDENTITY_ENTITIES:
             return RESERVED_IDENTITY_ENTITIES[label]
     return None
@@ -106,6 +118,7 @@ def _parse_reserved_identity(labels: list[str] | None) -> str | None:
 # Cluster enrichment – query Cilium for real endpoint labels
 # ---------------------------------------------------------------------------
 
+
 def _run_kubectl(*args: str, timeout: int = 30) -> bytes:
     """Run ``kubectl`` and return stdout bytes.  Raises ``RuntimeError`` on failure."""
     try:
@@ -114,10 +127,10 @@ def _run_kubectl(*args: str, timeout: int = 30) -> bytes:
             capture_output=True,
             timeout=timeout,
         )
-    except FileNotFoundError:
-        raise RuntimeError("kubectl not found in PATH")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"kubectl {' '.join(args)} timed out after {timeout}s")
+    except FileNotFoundError as exc:
+        raise RuntimeError("kubectl not found in PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"kubectl {' '.join(args)} timed out after {timeout}s") from exc
     if result.returncode != 0:
         raise RuntimeError(
             f"kubectl {' '.join(args)} exited {result.returncode}: "
@@ -143,10 +156,14 @@ def _build_pod_node_map() -> dict[tuple[str, str], str]:
 def _build_cilium_node_map() -> dict[str, str]:
     """Return ``{node_name: cilium_pod_name}`` from the cilium DaemonSet pods."""
     raw = _run_kubectl(
-        "get", "pods",
-        "-n", "kube-system",
-        "-l", "k8s-app=cilium",
-        "-o", "json",
+        "get",
+        "pods",
+        "-n",
+        "kube-system",
+        "-l",
+        "k8s-app=cilium",
+        "-o",
+        "json",
     )
     data = json.loads(raw)
     mapping: dict[str, str] = {}
@@ -162,8 +179,16 @@ def _cilium_endpoint_list(cilium_pod: str) -> list[dict[str, Any]]:
     """Run ``cilium endpoint list -o json`` on *cilium_pod* and return parsed list."""
     try:
         raw = _run_kubectl(
-            "exec", "-n", "kube-system", cilium_pod,
-            "--", "cilium", "endpoint", "list", "-o", "json",
+            "exec",
+            "-n",
+            "kube-system",
+            cilium_pod,
+            "--",
+            "cilium",
+            "endpoint",
+            "list",
+            "-o",
+            "json",
             timeout=60,
         )
         return json.loads(raw)
@@ -176,8 +201,17 @@ def _cilium_endpoint_get(cilium_pod: str, endpoint_id: int) -> dict[str, Any] | 
     """Run ``cilium endpoint get <id> -o json`` and return the endpoint object."""
     try:
         raw = _run_kubectl(
-            "exec", "-n", "kube-system", cilium_pod,
-            "--", "cilium", "endpoint", "get", str(endpoint_id), "-o", "json",
+            "exec",
+            "-n",
+            "kube-system",
+            cilium_pod,
+            "--",
+            "cilium",
+            "endpoint",
+            "get",
+            str(endpoint_id),
+            "-o",
+            "json",
             timeout=30,
         )
         data: Any = json.loads(raw)
@@ -278,13 +312,17 @@ def build_endpoint_label_cache(pods: set[tuple[str, str]]) -> EndpointLabelCache
             if ep_id is None:
                 LOG.warning(
                     "Endpoint for %s/%s not found in cilium endpoint list on %s; skipping.",
-                    ns, pod_name, cilium_pod,
+                    ns,
+                    pod_name,
+                    cilium_pod,
                 )
                 continue
 
             LOG.info(
                 "  %s/%s → endpoint %d; fetching labels via cilium endpoint get …",
-                ns, pod_name, ep_id,
+                ns,
+                pod_name,
+                ep_id,
             )
 
             # Step 4: precise label fetch via 'cilium endpoint get <id>'.
@@ -301,18 +339,19 @@ def build_endpoint_label_cache(pods: set[tuple[str, str]]) -> EndpointLabelCache
             else:
                 LOG.warning(
                     "No security-relevant labels for %s/%s (endpoint %d).",
-                    ns, pod_name, ep_id,
+                    ns,
+                    pod_name,
+                    ep_id,
                 )
 
-    LOG.info(
-        "Endpoint label cache: %d/%d pod(s) resolved.", len(cache), len(pods)
-    )
+    LOG.info("Endpoint label cache: %d/%d pod(s) resolved.", len(cache), len(pods))
     return cache
 
 
 # ---------------------------------------------------------------------------
 # Flow parsing
 # ---------------------------------------------------------------------------
+
 
 def _read_flows(path: str) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield *(lineno, flow_dict)* from a JSONL file or a JSON-array file."""
@@ -334,8 +373,7 @@ def _read_flows(path: str) -> Iterator[tuple[int, dict[str, Any]]]:
             except json.JSONDecodeError as exc:
                 LOG.error("Failed to parse JSON array: %s", exc)
                 return
-            for idx, flow in enumerate(flows, 1):
-                yield idx, flow
+            yield from enumerate(flows, 1)
         else:
             for lineno, line in enumerate(f, 1):
                 line = line.strip()
@@ -352,10 +390,10 @@ def parse_flows(
     label_keys: list[str],
     verdicts: set[str],
     namespaces: set[str],
-) -> tuple[dict[PolicyKey, RuleSet], Counter[FlowKey], int, int, dict[PolicyKey, set[tuple[str, str]]]]:
+) -> ParseResult:
     """Parse Hubble flows into per-workload rule sets.
 
-    Returns:
+    Returns a ``ParseResult`` tuple of:
         policies    - dict[(namespace, app)] -> {"egress": set, "ingress": set}
         flow_counts - Counter keyed by (src_ns, src_app, dst_ns, dst_app, port, proto)
         total       - total flow count
@@ -393,9 +431,9 @@ def _apply_flow(
     flow: dict[str, Any],
     label_keys: list[str],
     namespaces: set[str],
-    policies: "defaultdict[PolicyKey, RuleSet]",
-    flow_counts: "Counter[FlowKey]",
-    app_pods: "defaultdict[PolicyKey, set[tuple[str, str]]]",
+    policies: defaultdict[PolicyKey, RuleSet],
+    flow_counts: Counter[FlowKey],
+    app_pods: defaultdict[PolicyKey, set[tuple[str, str]]],
 ) -> bool:
     """Process a single pre-filtered flow dict, updating the three shared data structures.
 
@@ -434,14 +472,16 @@ def _apply_flow(
     src_display = src_app or src_pod or "unknown"
     dst_display = dst_app or dst_pod or "unknown"
 
-    flow_counts[(
-        (src_ns or "?") if not src_entity else "",
-        f"reserved:{src_entity}" if src_entity else src_display,
-        (dst_ns or "?") if not dst_entity else "",
-        f"reserved:{dst_entity}" if dst_entity else dst_display,
-        port,
-        proto,
-    )] += 1
+    flow_counts[
+        (
+            (src_ns or "?") if not src_entity else "",
+            f"reserved:{src_entity}" if src_entity else src_display,
+            (dst_ns or "?") if not dst_entity else "",
+            f"reserved:{dst_entity}" if dst_entity else dst_display,
+            port,
+            proto,
+        )
+    ] += 1
 
     # Encode reserved entities with a prefix so build_policy() can
     # distinguish them from regular workload names.
@@ -468,7 +508,7 @@ def _parse_flow_list(
     label_keys: list[str],
     verdicts: set[str],
     namespaces: set[str],
-) -> tuple[dict[PolicyKey, RuleSet], Counter[FlowKey], int, int, dict[PolicyKey, set[tuple[str, str]]]]:
+) -> ParseResult:
     """Parse an in-memory list of flow dicts into per-workload rule sets.
 
     Mirrors ``parse_flows`` but takes a pre-loaded list instead of a file path.
@@ -496,6 +536,7 @@ def _parse_flow_list(
 # Policy construction
 # ---------------------------------------------------------------------------
 
+
 def _consolidate_rules(
     rule_tuples: set[RuleTuple],
 ) -> list[tuple[str, str, list[tuple[int, str]]]]:
@@ -506,10 +547,7 @@ def _consolidate_rules(
     grouped: defaultdict[tuple[str, str], set[tuple[int, str]]] = defaultdict(set)
     for ns, app, port, proto in rule_tuples:
         grouped[(ns, app)].add((port, proto))
-    return [
-        (ns, app, sorted(ports))
-        for (ns, app), ports in sorted(grouped.items())
-    ]
+    return [(ns, app, sorted(ports)) for (ns, app), ports in sorted(grouped.items())]
 
 
 def build_policy(
@@ -585,6 +623,7 @@ def build_policy(
 # Output helpers
 # ---------------------------------------------------------------------------
 
+
 def _dump_yaml(policy: dict[str, Any], stream: IO[str]) -> None:
     """Serialize a policy dict to YAML preserving key insertion order."""
     yaml.dump(policy, stream, default_flow_style=False, sort_keys=False)
@@ -633,29 +672,33 @@ def _write_policy_dir(
 
 def _find_unknown_flows(flow_counts: Counter[FlowKey]) -> list[FlowKey]:
     """Return flow keys where source or destination could not be identified."""
-    return [
-        key for key in flow_counts
-        if key[1] == "unknown" or key[3] == "unknown"
-    ]
+    return [key for key in flow_counts if key[1] == "unknown" or key[3] == "unknown"]
 
 
-def _print_unknown_warnings(unknown_keys: list[FlowKey], flow_counts: Counter[FlowKey], file: IO[str] = sys.stderr) -> None:
+def _print_unknown_warnings(
+    unknown_keys: list[FlowKey],
+    flow_counts: Counter[FlowKey],
+    file: IO[str] = sys.stderr,
+) -> None:
     """Print an explicit warning block listing unidentified endpoints."""
     w = file.write
     total_unknown = sum(flow_counts[k] for k in unknown_keys)
     sep = "!" * 78
     w(f"\n{sep}\n")
-    w(f"WARNING: {len(unknown_keys)} unique flow(s) ({total_unknown} total) have "
-      f"unidentified endpoints.\n")
-    w("These flows have no recognised workload label or reserved identity\n"
-      "and will NOT be covered by any generated policy.\n")
+    w(
+        f"WARNING: {len(unknown_keys)} unique flow(s) ({total_unknown} total) have "
+        f"unidentified endpoints.\n"
+    )
+    w(
+        "These flows have no recognised workload label or reserved identity\n"
+        "and will NOT be covered by any generated policy.\n"
+    )
     w(f"{sep}\n")
     for key in unknown_keys:
         src_ns, src_app, dst_ns, dst_app, port, proto = key
         src = f"{src_ns}/{src_app}" if src_ns else src_app
         dst = f"{dst_ns}/{dst_app}" if dst_ns else dst_app
-        w(f"  {src:<30}  ->  {dst:<30}  {port:>5}  {proto}  "
-          f"(x{flow_counts[key]})\n")
+        w(f"  {src:<30}  ->  {dst:<30}  {port:>5}  {proto}  (x{flow_counts[key]})\n")
     w(f"{sep}\n")
     w("Hint: use --label-key to add additional workload label keys.\n\n")
 
@@ -663,8 +706,7 @@ def _print_unknown_warnings(unknown_keys: list[FlowKey], flow_counts: Counter[Fl
 def _print_summary(total: int, matched: int, policy_count: int, file: IO[str] = sys.stderr) -> None:
     count_word = "policy" if policy_count == 1 else "policies"
     print(
-        f"Processed {total} flows - {matched} matched - "
-        f"{policy_count} {count_word} generated.",
+        f"Processed {total} flows - {matched} matched - {policy_count} {count_word} generated.",
         file=file,
     )
 
@@ -723,13 +765,17 @@ def _print_report(
         dst_col = max(10, available - src_col)
 
     row_len = FIXED + src_col + dst_col
-    sep  = "=" * row_len
+    sep = "=" * row_len
     dash = "-" * row_len
 
     w(f"\n{sep}\n")
     w("FLOW REPORT - unique observed connections (sorted by frequency)\n")
     w(f"{sep}\n")
-    w(f"{'COUNT':>7}  {'SOURCE':<{src_col}}  {'':2}  {'DESTINATION':<{dst_col}}  {'PORT':>5}  {'PROTO':<{max_proto}}\n")
+    hdr = (
+        f"{'COUNT':>7}  {'SOURCE':<{src_col}}  {'':2}  "
+        f"{'DESTINATION':<{dst_col}}  {'PORT':>5}  {'PROTO':<{max_proto}}"
+    )
+    w(f"{hdr}\n")
     w(f"{dash}\n")
 
     for src, dst, port, proto, count in rows:
@@ -739,10 +785,7 @@ def _print_report(
         )
 
     w(f"{dash}\n")
-    w(
-        f"Total: {total} flows, {matched} matched, "
-        f"{len(flow_counts)} unique connections\n"
-    )
+    w(f"Total: {total} flows, {matched} matched, {len(flow_counts)} unique connections\n")
     w(f"{sep}\n")
     return ordered_keys
 
@@ -750,6 +793,7 @@ def _print_report(
 # ---------------------------------------------------------------------------
 # Live watch mode
 # ---------------------------------------------------------------------------
+
 
 class LiveFlowStore:
     """Thread-safe rolling buffer of unwrapped Hubble flow dicts.
@@ -759,7 +803,7 @@ class LiveFlowStore:
     (the default) to accumulate all flows without limit.
     """
 
-    def __init__(self, window_seconds: float = 0, capture_fh: "IO[str] | None" = None) -> None:
+    def __init__(self, window_seconds: float = 0, capture_fh: IO[str] | None = None) -> None:
         self._lock = threading.Lock()
         self._flows: deque[tuple[float, dict[str, Any]]] = deque()
         self.window_seconds = window_seconds
@@ -829,8 +873,15 @@ def _detect_hubble_cmd() -> tuple[list[str], bool]:
                 cilium_pod = next(iter(sorted(cilium_node_map.values())))
                 logging.debug("hubble: using kubectl exec into %s", cilium_pod)
                 return [
-                    "kubectl", "exec", "-n", "kube-system", "-i", cilium_pod,
-                    "--", "hubble", "observe",
+                    "kubectl",
+                    "exec",
+                    "-n",
+                    "kube-system",
+                    "-i",
+                    cilium_pod,
+                    "--",
+                    "hubble",
+                    "observe",
                 ], False
         except RuntimeError:
             pass
@@ -841,7 +892,7 @@ def _detect_hubble_cmd() -> tuple[list[str], bool]:
     )
 
 
-def _build_hubble_observe_cmd(args: "argparse.Namespace") -> list[str]:
+def _build_hubble_observe_cmd(args: argparse.Namespace) -> list[str]:
     """Build the complete ``hubble observe`` command list from parsed CLI args."""
     add_port_forward = False
     if args.hubble_cmd:
@@ -869,7 +920,7 @@ def _build_hubble_observe_cmd(args: "argparse.Namespace") -> list[str]:
 
 
 def _hubble_reader_thread(
-    proc: "subprocess.Popen[str]",
+    proc: subprocess.Popen[str],
     store: LiveFlowStore,
     stop_event: threading.Event,
 ) -> None:
@@ -894,7 +945,7 @@ def _hubble_reader_thread(
 
 
 def _hubble_stderr_thread(
-    proc: "subprocess.Popen[str]",
+    proc: subprocess.Popen[str],
     store: LiveFlowStore,
     stop_event: threading.Event,
 ) -> None:
@@ -915,7 +966,7 @@ def _launch_hubble(
     hubble_cmd: list[str],
     store: LiveFlowStore,
     stop_event: threading.Event,
-) -> "subprocess.Popen[str]":
+) -> subprocess.Popen[str]:
     """Start ``hubble observe`` and its two reader threads; return the process."""
     proc: subprocess.Popen[str] = subprocess.Popen(
         hubble_cmd,
@@ -934,7 +985,7 @@ def _launch_hubble(
     return proc
 
 
-def _build_policies_from_flow_keys(keys: "set[FlowKey]") -> "dict[PolicyKey, RuleSet]":
+def _build_policies_from_flow_keys(keys: set[FlowKey]) -> dict[PolicyKey, RuleSet]:
     """Build a policies dict from an explicit set of flow keys.
 
     Mirrors the rule-building logic of ``_apply_flow`` so that watch-mode
@@ -949,19 +1000,22 @@ def _build_policies_from_flow_keys(keys: "set[FlowKey]") -> "dict[PolicyKey, Rul
     def _to_peer(app: str) -> str:
         return "entity:" + app.removeprefix("reserved:") if app.startswith("reserved:") else app
 
+    def _is_workload(ns: str, app: str) -> bool:
+        return bool(ns and app and app not in ("", "unknown") and not app.startswith("reserved:"))
+
     for src_ns, src_app, dst_ns, dst_app, port, proto in keys:
-        if src_ns and src_app and src_app not in ("", "unknown") and not src_app.startswith("reserved:"):
+        if _is_workload(src_ns, src_app):
             policies[(src_ns, src_app)]["egress"].add(
                 (dst_ns or "", _to_peer(dst_app), port, proto)
             )
-        if dst_ns and dst_app and dst_app not in ("", "unknown") and not dst_app.startswith("reserved:"):
+        if _is_workload(dst_ns, dst_app):
             policies[(dst_ns, dst_app)]["ingress"].add(
                 (src_ns or "", _to_peer(src_app), port, proto)
             )
     return dict(policies)
 
 
-def _watch_mode(args: "argparse.Namespace") -> None:
+def _watch_mode(args: argparse.Namespace) -> None:
     """Live monitoring mode: spawn ``hubble observe`` and refresh the report.
 
     Keys (Mac-primary, all modes):
@@ -994,7 +1048,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
     interval: float = args.interval
     window: float = args.window
 
-    capture_fh: "IO[str] | None" = None
+    capture_fh: IO[str] | None = None
     if getattr(args, "capture_file", None):
         capture_fh = open(args.capture_file, "w", encoding="utf-8")
 
@@ -1003,7 +1057,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
     # Optionally seed from an existing flows file (useful to pre-populate history).
     # Seeded flows are NOT written to the capture file (they already exist on disk).
     if args.flows_file and os.path.isfile(args.flows_file):
-        with store.suspend_capture():    # suppress capture during seed
+        with store.suspend_capture():  # suppress capture during seed
             for _, flow in _read_flows(args.flows_file):
                 if "flow" in flow and "source" not in flow:
                     flow = flow["flow"]
@@ -1030,7 +1084,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
         sys.exit(EXIT_ERROR)
 
     _RECONNECT_DELAY_INIT = 2.0
-    _RECONNECT_DELAY_MAX  = 60.0
+    _RECONNECT_DELAY_MAX = 60.0
     reconnect_state = {"delay": _RECONNECT_DELAY_INIT, "at": 0.0}
 
     # Header layout (screen rows):
@@ -1050,26 +1104,26 @@ def _watch_mode(args: "argparse.Namespace") -> None:
     generate_flag: bool = False
     selected_keys_final: set[FlowKey] = set()
 
-    def _run(stdscr: "curses.window") -> None:  # type: ignore[name-defined]
+    def _run(stdscr: curses.window) -> None:  # type: ignore[name-defined]
         nonlocal final_content, generate_flag
         if curses.has_colors():
             curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_GREEN,  -1)  # live / selected
+            curses.init_pair(1, curses.COLOR_GREEN, -1)  # live / selected
             curses.init_pair(2, curses.COLOR_YELLOW, -1)  # paused / warning
-            curses.init_pair(3, curses.COLOR_RED,    -1)  # error
+            curses.init_pair(3, curses.COLOR_RED, -1)  # error
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.keypad(True)
 
         scroll_offset = 0
-        is_following = True        # auto-follow top of report (most-frequent first)
-        is_paused    = False
+        is_following = True  # auto-follow top of report (most-frequent first)
+        is_paused = False
         is_selecting = False
-        cursor_flow_idx = 0        # index into ordered_keys when selecting
+        cursor_flow_idx = 0  # index into ordered_keys when selecting
         selected_keys: set[FlowKey] = set()
 
-        ordered_keys: list[FlowKey] = []   # flow keys in display order (rebuilt each refresh)
-        key_map: dict[int, FlowKey] = {}   # content_line_index → FlowKey
+        ordered_keys: list[FlowKey] = []  # flow keys in display order (rebuilt each refresh)
+        key_map: dict[int, FlowKey] = {}  # content_line_index → FlowKey
         content_lines: list[str] = []
         last_refresh = 0.0
 
@@ -1078,31 +1132,31 @@ def _watch_mode(args: "argparse.Namespace") -> None:
             height, width = stdscr.getmaxyx()
             half_page = max(1, (height - HEADER_LINES) // 2)
 
-            if key in (ord("q"), ord("Q"), 3):                   # quit
+            if key in (ord("q"), ord("Q"), 3):  # quit
                 break
 
             elif key == ord(" "):
-                if is_selecting:                                  # toggle selection
+                if is_selecting:  # toggle selection
                     if 0 <= cursor_flow_idx < len(ordered_keys):
                         fk = ordered_keys[cursor_flow_idx]
                         if fk in selected_keys:
                             selected_keys.discard(fk)
                         else:
                             selected_keys.add(fk)
-                else:                                             # pause / resume
+                else:  # pause / resume
                     is_paused = not is_paused
 
-            elif key in (ord("s"), ord("S")):                     # toggle select mode
+            elif key in (ord("s"), ord("S")):  # toggle select mode
                 is_selecting = not is_selecting
                 if is_selecting:
                     cursor_flow_idx = min(cursor_flow_idx, max(0, len(ordered_keys) - 1))
 
-            elif key == 27:                                       # Esc – exit select + clear
+            elif key == 27:  # Esc – exit select + clear
                 is_selecting = False
                 selected_keys.clear()
                 cursor_flow_idx = 0
 
-            elif key in (10, 13, curses.KEY_ENTER):               # Enter – generate + quit
+            elif key in (10, 13, curses.KEY_ENTER):  # Enter – generate + quit
                 if is_selecting and selected_keys:
                     generate_flag = True
                     selected_keys_final.update(selected_keys)
@@ -1144,7 +1198,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
             elif key in (ord("G"), curses.KEY_END):
                 if is_selecting and ordered_keys:
                     cursor_flow_idx = len(ordered_keys) - 1
-                scroll_offset = len(content_lines)   # clamped below
+                scroll_offset = len(content_lines)  # clamped below
                 is_following = False
 
             now_mono = time.monotonic()
@@ -1202,7 +1256,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
             else:
                 scroll_offset = min(scroll_offset, max_scroll)
                 if scroll_offset <= 0:
-                    is_following = True   # scrolled back to top → re-enable
+                    is_following = True  # scrolled back to top → re-enable
 
             # In selection mode keep the cursor row visible.
             if is_selecting and ordered_keys:
@@ -1235,20 +1289,27 @@ def _watch_mode(args: "argparse.Namespace") -> None:
                 f"  \u2022  Total received: {store.total_received}{cap_note}  "
             )
             if is_paused:
-                badge, badge_attr = "\u23f8 PAUSED", (
-                    curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                badge, badge_attr = (
+                    "\u23f8 PAUSED",
+                    (
+                        curses.color_pair(2) | curses.A_BOLD
+                        if curses.has_colors()
+                        else curses.A_BOLD
+                    ),
                 )
             elif store.connected:
-                badge, badge_attr = "\u25cf Live", (
-                    curses.color_pair(1) if curses.has_colors() else curses.A_NORMAL
+                badge, badge_attr = (
+                    "\u25cf Live",
+                    (curses.color_pair(1) if curses.has_colors() else curses.A_NORMAL),
                 )
             elif now_mono < reconnect_state["at"]:
                 secs_left = int(reconnect_state["at"] - now_mono)
                 badge = f"\u26a0 Disconnected \u2013 reconnecting in {secs_left}s"
                 badge_attr = curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
             else:
-                badge, badge_attr = "\u26a0 Reconnecting\u2026", (
-                    curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
+                badge, badge_attr = (
+                    "\u26a0 Reconnecting\u2026",
+                    (curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL),
                 )
             try:
                 stdscr.addnstr(1, 0, prefix, width - 1)
@@ -1260,10 +1321,11 @@ def _watch_mode(args: "argparse.Namespace") -> None:
             if is_selecting:
                 n_sel = len(selected_keys)
                 sel_hint = (
-                    f"SELECT  Space toggle  Enter generate ({n_sel} selected)"
-                    f"  j/k move  s/Esc exit"
+                    f"SELECT  Space toggle  Enter generate ({n_sel} selected)  j/k move  s/Esc exit"
                 )
-                sel_attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                sel_attr = (
+                    curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                )
                 try:
                     stdscr.addnstr(2, 0, sel_hint, width - 1, sel_attr)
                 except curses.error:
@@ -1280,14 +1342,18 @@ def _watch_mode(args: "argparse.Namespace") -> None:
             # ---- Draw scrollable content -------------------------------------
             cursor_line = DATA_ROW_OFFSET + cursor_flow_idx if is_selecting else -1
             for i, line in enumerate(
-                content_lines[scroll_offset: scroll_offset + content_viewport]
+                content_lines[scroll_offset : scroll_offset + content_viewport]
             ):
                 abs_idx = scroll_offset + i
                 attr = curses.A_NORMAL
                 if is_selecting and abs_idx in key_map:
                     fk = key_map[abs_idx]
                     if fk in selected_keys:
-                        attr |= curses.color_pair(1) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                        attr |= (
+                            curses.color_pair(1) | curses.A_BOLD
+                            if curses.has_colors()
+                            else curses.A_BOLD
+                        )
                     if abs_idx == cursor_line:
                         attr |= curses.A_REVERSE
                 try:
@@ -1309,7 +1375,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
                     pass
 
             stdscr.refresh()
-            time.sleep(0.05)   # ~20 fps – keeps key input responsive
+            time.sleep(0.05)  # ~20 fps – keeps key input responsive
 
     try:
         curses.wrapper(_run)
@@ -1357,6 +1423,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1413,27 +1480,40 @@ Interactive flow selection (press s in watch mode):
         ),
     )
     parser.add_argument(
-        "-o", "--output-dir", default=".",
+        "-o",
+        "--output-dir",
+        default=".",
         help="Directory to write policy YAML files (default: current directory)",
     )
     parser.add_argument(
-        "-n", "--namespace", action="append", default=None, dest="namespaces",
+        "-n",
+        "--namespace",
+        action="append",
+        default=None,
+        dest="namespaces",
         help="Only generate policies for this namespace (can be repeated)",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Print generated policies to stdout instead of writing files",
     )
     parser.add_argument(
-        "--single-file", metavar="FILE",
+        "--single-file",
+        metavar="FILE",
         help="Write all policies to a single multi-document YAML file",
     )
     parser.add_argument(
-        "--verdict", action="append", default=None,
+        "--verdict",
+        action="append",
+        default=None,
         help="Only include flows with this verdict (can be repeated; default: all)",
     )
     parser.add_argument(
-        "--label-key", action="append", default=None, dest="label_keys",
+        "--label-key",
+        action="append",
+        default=None,
+        dest="label_keys",
         help=(
             "Kubernetes label key used to identify workloads, "
             "prefixed with 'k8s:' (can be repeated; "
@@ -1441,15 +1521,19 @@ Interactive flow selection (press s in watch mode):
         ),
     )
     parser.add_argument(
-        "--report", action="store_true",
+        "--report",
+        action="store_true",
         help="Print a frequency report of unique observed flows to stderr",
     )
     parser.add_argument(
-        "--report-only", action="store_true",
+        "--report-only",
+        action="store_true",
         help="Print the flow report and exit without generating policies",
     )
     parser.add_argument(
-        "-w", "--watch", action="store_true",
+        "-w",
+        "--watch",
+        action="store_true",
         help=(
             "Live monitoring mode: spawn hubble observe internally and "
             "continuously refresh the flow-frequency report on screen. "
@@ -1458,18 +1542,26 @@ Interactive flow selection (press s in watch mode):
         ),
     )
     parser.add_argument(
-        "--interval", type=float, default=2.0, metavar="SECONDS",
+        "--interval",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
         help="Screen refresh interval for --watch mode (default: 2.0)",
     )
     parser.add_argument(
-        "--window", type=float, default=0.0, metavar="SECONDS",
+        "--window",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
         help=(
             "Rolling time window for --watch mode: only count flows received "
             "in the last N seconds (default: 0 = keep all flows)"
         ),
     )
     parser.add_argument(
-        "--hubble-cmd", default=None, metavar="CMD",
+        "--hubble-cmd",
+        default=None,
+        metavar="CMD",
         help=(
             "Override the hubble observe command used by --watch mode. "
             "Accepts a shell-quoted string, e.g. "
@@ -1478,7 +1570,8 @@ Interactive flow selection (press s in watch mode):
         ),
     )
     parser.add_argument(
-        "--capture-file", metavar="FILE",
+        "--capture-file",
+        metavar="FILE",
         help=(
             "Append all flows received during --watch mode to FILE as JSONL. "
             "The file is overwritten at the start of each session. "
@@ -1487,7 +1580,8 @@ Interactive flow selection (press s in watch mode):
         ),
     )
     parser.add_argument(
-        "--no-enrich", action="store_true",
+        "--no-enrich",
+        action="store_true",
         help=(
             "Skip live cluster enrichment. By default the tool queries "
             "cilium endpoint list / cilium endpoint get on each Cilium pod "
@@ -1497,11 +1591,15 @@ Interactive flow selection (press s in watch mode):
         ),
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true",
+        "-v",
+        "--verbose",
+        action="store_true",
         help="Enable verbose logging",
     )
     parser.add_argument(
-        "-V", "--version", action="version",
+        "-V",
+        "--version",
+        action="version",
         version=f"%(prog)s {__version__}",
     )
     return parser
@@ -1551,17 +1649,13 @@ def main() -> None:
         sys.exit(EXIT_OK)
 
     if not policies:
-        LOG.warning(
-            "No policies generated (parsed %d flows, %d matched)", total, matched
-        )
+        LOG.warning("No policies generated (parsed %d flows, %d matched)", total, matched)
         sys.exit(EXIT_NO_POLICIES)
 
     # --- Cluster enrichment: resolve authoritative Cilium security labels ---
     workload_labels: WorkloadLabels = {}
     if not args.no_enrich:
-        all_pods: set[tuple[str, str]] = {
-            pod for pods in app_pods.values() for pod in pods
-        }
+        all_pods: set[tuple[str, str]] = {pod for pods in app_pods.values() for pod in pods}
         if all_pods:
             endpoint_cache = build_endpoint_label_cache(all_pods)
             if endpoint_cache:
@@ -1589,8 +1683,7 @@ def main() -> None:
 
     # Build sorted iteration for consistent output.
     sorted_policies: list[tuple[str, str, RuleSet]] = [
-        (ns, app, rules)
-        for (ns, app), rules in sorted(policies.items())
+        (ns, app, rules) for (ns, app), rules in sorted(policies.items())
     ]
 
     # --- Dry-run: print to stdout ---
