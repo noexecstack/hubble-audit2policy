@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -63,6 +63,12 @@ RESERVED_IDENTITY_ENTITIES: dict[str, str] = {
     "reserved:kube-apiserver": "kube-apiserver",
     "reserved:ingress": "ingress",
 }
+
+# Label prefixes excluded when converting Cilium security labels to matchLabels.
+_EXCLUDED_LABEL_PREFIXES = (
+    "k8s:io.cilium.k8s.namespace.labels.",
+    "k8s:io.cilium.k8s.policy.cluster=",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -192,13 +198,9 @@ def _security_labels_to_match_labels(security_labels: list[str]) -> dict[str, st
     The ``k8s:`` source prefix is stripped; Cilium adds it back automatically
     when evaluating ``matchLabels`` on Kubernetes endpoints.
     """
-    EXCLUDED_PREFIXES = (
-        "k8s:io.cilium.k8s.namespace.labels.",
-        "k8s:io.cilium.k8s.policy.cluster=",
-    )
     result: dict[str, str] = {}
     for lbl in security_labels:
-        if any(lbl.startswith(p) for p in EXCLUDED_PREFIXES):
+        if any(lbl.startswith(p) for p in _EXCLUDED_LABEL_PREFIXES):
             continue
         if lbl.startswith("reserved:"):
             continue
@@ -598,6 +600,35 @@ def _write_multi_doc_yaml(
         if idx > 0:
             stream.write("---\n")
         _dump_yaml(build_policy(ns, app, rules, workload_labels=workload_labels), stream)
+
+
+def _write_policy_dir(
+    sorted_policies: list[tuple[str, str, RuleSet]],
+    output_dir: str,
+    workload_labels: WorkloadLabels | None = None,
+) -> int:
+    """Write per-workload YAML files to *output_dir* with path-safety checks.
+
+    Returns the number of files successfully written.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    real_dir = os.path.realpath(output_dir)
+    written = 0
+    for ns, app, rules in sorted_policies:
+        safe_ns = sanitize_name(ns)
+        safe_app = sanitize_name(app)
+        if not safe_ns or not safe_app:
+            LOG.warning("Skipping workload with unsanitizable name: %s/%s", ns, app)
+            continue
+        filepath = os.path.realpath(os.path.join(real_dir, f"{safe_ns}-{safe_app}.yaml"))
+        if not filepath.startswith(real_dir + os.sep):
+            LOG.warning("Skipping unsafe path for %s/%s", ns, app)
+            continue
+        with open(filepath, "w", encoding="utf-8") as fh:
+            _dump_yaml(build_policy(ns, app, rules, workload_labels=workload_labels), fh)
+        LOG.debug("Generated: %s", filepath)
+        written += 1
+    return written
 
 
 def _find_unknown_flows(flow_counts: Counter[FlowKey]) -> list[FlowKey]:
@@ -1014,12 +1045,13 @@ def _watch_mode(args: "argparse.Namespace") -> None:
     #   "" (leading \n), sep, "FLOW REPORT...", sep, header-row, dash  → 6 lines
     DATA_ROW_OFFSET = 6
 
-    # Mutable containers shared between _run() and the outer scope.
-    final_content: list[list[str]] = [[]]
-    generate_flag: list[bool] = [False]
+    # Shared state between _run() and the outer scope.
+    final_content: list[str] = []
+    generate_flag: bool = False
     selected_keys_final: set[FlowKey] = set()
 
     def _run(stdscr: "curses.window") -> None:  # type: ignore[name-defined]
+        nonlocal final_content, generate_flag
         if curses.has_colors():
             curses.use_default_colors()
             curses.init_pair(1, curses.COLOR_GREEN,  -1)  # live / selected
@@ -1072,7 +1104,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
 
             elif key in (10, 13, curses.KEY_ENTER):               # Enter – generate + quit
                 if is_selecting and selected_keys:
-                    generate_flag[0] = True
+                    generate_flag = True
                     selected_keys_final.update(selected_keys)
                     break
 
@@ -1153,7 +1185,7 @@ def _watch_mode(args: "argparse.Namespace") -> None:
                     "  \u2022  g/G top/bottom  \u2022  s select  \u2022  q quit\n"
                 )
                 content_lines = buf.getvalue().splitlines()
-                final_content[0] = content_lines
+                final_content = content_lines
 
                 # Clamp cursor to valid range after data changes.
                 if ordered_keys:
@@ -1294,13 +1326,13 @@ def _watch_mode(args: "argparse.Namespace") -> None:
             capture_fh.close()
 
     # Print the last snapshot so the user is not left with a blank screen.
-    if final_content[0]:
+    if final_content:
         print()
-        for line in final_content[0]:
+        for line in final_content:
             print(line)
 
     # Generate policies from selected flows (triggered by Enter in select mode).
-    if generate_flag[0] and selected_keys_final:
+    if generate_flag and selected_keys_final:
         policies = _build_policies_from_flow_keys(selected_keys_final)
         sorted_policies = [(ns, app, rules) for (ns, app), rules in sorted(policies.items())]
         n_pol = len(sorted_policies)
@@ -1312,24 +1344,10 @@ def _watch_mode(args: "argparse.Namespace") -> None:
         if args.dry_run:
             _write_multi_doc_yaml(sorted_policies, sys.stdout)
         else:
-            os.makedirs(args.output_dir, exist_ok=True)
-            out_dir = os.path.realpath(args.output_dir)
-            written = 0
-            for ns, app, rules in sorted_policies:
-                safe_ns  = sanitize_name(ns)
-                safe_app = sanitize_name(app)
-                if not safe_ns or not safe_app:
-                    LOG.warning("Skipping unsanitizable workload name: %s/%s", ns, app)
-                    continue
-                filepath = os.path.realpath(os.path.join(out_dir, f"{safe_ns}-{safe_app}.yaml"))
-                if not filepath.startswith(out_dir + os.sep):
-                    LOG.warning("Skipping unsafe path for %s/%s", ns, app)
-                    continue
-                with open(filepath, "w", encoding="utf-8") as fh:
-                    _dump_yaml(build_policy(ns, app, rules), fh)
-                written += 1
+            written = _write_policy_dir(sorted_policies, args.output_dir)
             print(
-                f"Wrote {written} {'policy' if written == 1 else 'policies'} to {out_dir}",
+                f"Wrote {written} {'policy' if written == 1 else 'policies'} "
+                f"to {os.path.realpath(args.output_dir)}",
                 file=sys.stderr,
             )
 
@@ -1592,28 +1610,7 @@ def main() -> None:
         return
 
     # --- Multi-file mode (default) ---
-    os.makedirs(args.output_dir, exist_ok=True)
-    output_dir = os.path.realpath(args.output_dir)
-
-    written = 0
-    for ns, app, rules in sorted_policies:
-        safe_ns = sanitize_name(ns)
-        safe_app = sanitize_name(app)
-        if not safe_ns or not safe_app:
-            LOG.warning(
-                "Skipping workload with unsanitizable name: %s/%s", ns, app
-            )
-            continue
-        safe_name = f"{safe_ns}-{safe_app}.yaml"
-        filepath = os.path.realpath(os.path.join(output_dir, safe_name))
-        if not filepath.startswith(output_dir + os.sep):
-            LOG.warning("Skipping unsafe path for %s/%s", ns, app)
-            continue
-        with open(filepath, "w", encoding="utf-8") as fh:
-            _dump_yaml(build_policy(ns, app, rules, workload_labels=workload_labels), fh)
-        LOG.debug("Generated: %s", filepath)
-        written += 1
-
+    written = _write_policy_dir(sorted_policies, args.output_dir, workload_labels=workload_labels)
     _print_summary(total, matched, written)
 
 
