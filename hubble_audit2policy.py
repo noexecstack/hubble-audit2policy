@@ -191,7 +191,8 @@ def _cilium_endpoint_list(cilium_pod: str) -> list[dict[str, Any]]:
             "json",
             timeout=60,
         )
-        return json.loads(raw)
+        result: list[dict[str, Any]] = json.loads(raw)
+        return result
     except (RuntimeError, json.JSONDecodeError) as exc:
         LOG.warning("cilium endpoint list failed on %s: %s", cilium_pod, exc)
         return []
@@ -604,7 +605,7 @@ def build_policy(
     ingress: list[dict[str, Any]] = []
     for src_ns, src_app, ports in _consolidate_rules(rules["ingress"]):
         port_list = [{"port": str(p), "protocol": pr} for p, pr in ports]
-        rule: dict[str, Any] = {"toPorts": [{"ports": port_list}]}
+        rule = {"toPorts": [{"ports": port_list}]}
         if src_app.startswith("entity:"):
             rule["fromEntities"] = [src_app.removeprefix("entity:")]
         elif src_app:
