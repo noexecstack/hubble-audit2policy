@@ -27,7 +27,7 @@ import threading
 import time
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
-from typing import IO, Any, Generator, cast
+from typing import IO, Any, Generator, Iterator, cast
 
 import yaml
 
@@ -75,10 +75,14 @@ def sanitize_name(value: str | None) -> str:
 
 
 def _parse_identity_label(labels: list[str] | None, label_keys: list[str]) -> str | None:
-    """Return the first matching identity label value, or *None*."""
-    for label in (labels or []):
-        for key in label_keys:
-            prefix = key + "="
+    """Return the first matching identity label value, or *None*.
+
+    *label_keys* are searched in priority order: the first key that matches
+    any label wins, regardless of label list ordering.
+    """
+    for key in label_keys:
+        prefix = key + "="
+        for label in (labels or []):
             if label.startswith(prefix):
                 return label.split("=", 1)[1]
     return None
@@ -308,7 +312,7 @@ def build_endpoint_label_cache(pods: set[tuple[str, str]]) -> EndpointLabelCache
 # Flow parsing
 # ---------------------------------------------------------------------------
 
-def _read_flows(path: str) -> Any:
+def _read_flows(path: str) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield *(lineno, flow_dict)* from a JSONL file or a JSON-array file."""
     with open(path, encoding="utf-8") as f:
         # Peek at the first non-whitespace character to detect format.
