@@ -7,7 +7,13 @@ Built for platform engineers, SREs, and security engineers who need to bootstrap
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install .
+```
+
+For development (includes pytest, ruff, mypy):
+
+```bash
+pip install -e ".[dev]"
 ```
 
 ## Quick Start
