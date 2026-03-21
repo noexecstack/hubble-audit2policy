@@ -26,19 +26,19 @@ hubble observe -P --all-namespaces --verdict AUDIT -o json -f > cluster-flows.js
 
 ```bash
 # Write per-workload YAML files to a directory:
-./hubble-audit2policy.py flows.json -o policies/
+./hubble_audit2policy.py flows.json -o policies/
 
 # Preview to stdout without writing files:
-./hubble-audit2policy.py flows.json --dry-run
+./hubble_audit2policy.py flows.json --dry-run
 
 # Write all policies to a single multi-document YAML file:
-./hubble-audit2policy.py flows.json --single-file policies/all.yaml
+./hubble_audit2policy.py flows.json --single-file policies/all.yaml
 
 # Filter by namespace:
-./hubble-audit2policy.py flows.json -n monitoring -n default -o policies/
+./hubble_audit2policy.py flows.json -n monitoring -n default -o policies/
 
 # Print a flow frequency report:
-./hubble-audit2policy.py flows.json --report
+./hubble_audit2policy.py flows.json --report
 ```
 
 ### 3. Live watch mode
@@ -47,16 +47,16 @@ Watch mode spawns `hubble observe` internally and continuously refreshes a flow-
 
 ```bash
 # All namespaces, auto-detect hubble:
-./hubble-audit2policy.py --watch
+./hubble_audit2policy.py --watch
 
 # Single namespace, 5s refresh, rolling 2-minute window:
-./hubble-audit2policy.py --watch -n default --interval 5 --window 120
+./hubble_audit2policy.py --watch -n default --interval 5 --window 120
 
 # Seed from an existing file, then follow live:
-./hubble-audit2policy.py flows.json --watch
+./hubble_audit2policy.py flows.json --watch
 
 # Custom hubble command (e.g. kubectl exec):
-./hubble-audit2policy.py --watch --hubble-cmd 'kubectl exec -n kube-system cilium-xyz -- hubble observe'
+./hubble_audit2policy.py --watch --hubble-cmd 'kubectl exec -n kube-system cilium-xyz -- hubble observe'
 ```
 
 Hubble is auto-detected: the `hubble` binary on PATH is tried first (with `-P` for port-forwarding), falling back to `kubectl exec` into a Cilium DaemonSet pod.
@@ -64,15 +64,15 @@ Hubble is auto-detected: the `hubble` binary on PATH is tried first (with `-P` f
 **Capture while watching** for later replay:
 
 ```bash
-./hubble-audit2policy.py --watch --capture-file session.jsonl
-./hubble-audit2policy.py session.jsonl -o policies/
+./hubble_audit2policy.py --watch --capture-file session.jsonl
+./hubble_audit2policy.py session.jsonl -o policies/
 ```
 
 **Interactive flow selection** — press `s` in watch mode to enter select mode, pick the flows you care about, then press `Enter` to generate policies from just those flows:
 
 ```bash
-./hubble-audit2policy.py --watch --output-dir policies/
-./hubble-audit2policy.py --watch --dry-run   # preview selected policies on stdout
+./hubble_audit2policy.py --watch --output-dir policies/
+./hubble_audit2policy.py --watch --dry-run   # preview selected policies on stdout
 ```
 
 #### Watch mode keys
@@ -95,7 +95,7 @@ By default the tool queries `cilium endpoint list` and `cilium endpoint get` on 
 Requires `kubectl` access. Skip it when working offline:
 
 ```bash
-./hubble-audit2policy.py flows.json -o policies/ --no-enrich
+./hubble_audit2policy.py flows.json -o policies/ --no-enrich
 ```
 
 ## Usage

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-21
+
+### Added
+
+- Unit test suite covering helpers, flow parsing, policy construction, and file output.
+- GitHub Actions CI workflow (lint, type-check, test on Python 3.10–3.12).
+- `pyproject.toml` dev dependencies (`pytest`, `ruff`, `mypy`), tool configuration, and `py.typed` marker.
+
+### Fixed
+
+- Rename `hubble-audit2policy.py` to `hubble_audit2policy.py` — hyphens in filenames prevent Python module import, breaking the `pyproject.toml` entry point.
+
+### Changed
+
+- Update README examples to use the new `hubble_audit2policy.py` filename.
+
 ## [0.3.0] - 2026-03-21
 
 ### Changed

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hubble-audit2policy"
-version = "0.3.0"
+version = "0.4.0"
 description = "Generate least-privilege CiliumNetworkPolicy YAML from Hubble flow logs."
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,7 +17,6 @@ classifiers = [
     "Environment :: Console :: Curses",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Information Technology",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
     "Topic :: System :: Networking :: Firewalls",
@@ -25,9 +24,34 @@ classifiers = [
 ]
 dependencies = ["pyyaml>=6.0"]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4", "mypy>=1.10"]
+
 [project.scripts]
-hubble-audit2policy = "hubble-audit2policy:main"
+hubble-audit2policy = "hubble_audit2policy:main"
 
 [project.urls]
 Homepage = "https://github.com/noexecstack/hubble-audit2policy"
 Issues = "https://github.com/noexecstack/hubble-audit2policy/issues"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+    "SIM102",   # nested-if — clearer than combined conditions in flow parsing
+    "SIM105",   # contextlib.suppress — try/except/pass is idiomatic for curses
+    "SIM108",   # ternary — multi-line if/else is more readable for assignments
+    "SIM115",   # open-in-with — capture file handle managed by finally block
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
