@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hubble-audit2policy"
-version = "0.5.1"
+version = "0.6.0"
 description = "Generate least-privilege CiliumNetworkPolicy YAML from Hubble flow logs."
 readme = "README.md"
 license = "Apache-2.0"
