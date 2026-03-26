@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -25,6 +25,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 from collections import Counter, defaultdict, deque
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
@@ -386,11 +388,114 @@ def _read_flows(path: str) -> Iterator[tuple[int, dict[str, Any]]]:
                     LOG.warning("Skipping malformed JSON on line %d: %s", lineno, exc)
 
 
+def _parse_duration(value: str) -> float:
+    """Parse a human-friendly duration string into seconds.
+
+    Accepted formats: ``30s``, ``5m``, ``2h``, ``1d``, plain seconds (``3600``).
+    """
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd])?", value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"Invalid duration {value!r} — expected e.g. 30s, 5m, 2h, 1d"
+        )
+    num = float(match.group(1))
+    unit = match.group(2) or "s"
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return num * multipliers[unit]
+
+
+def _read_flows_loki(
+    loki_url: str,
+    query: str,
+    since_seconds: float,
+    until_seconds: float,
+    limit: int = 5000,
+) -> Iterator[tuple[int, dict[str, Any]]]:
+    """Yield *(lineno, flow_dict)* by querying a Loki instance.
+
+    Parameters
+    ----------
+    loki_url:
+        Base URL of the Loki instance, e.g. ``http://loki:3100``.
+    query:
+        LogQL stream selector, e.g. ``{app="hubble"}``.
+    since_seconds:
+        Start of the query window as seconds before *now*.
+    until_seconds:
+        End of the query window as seconds before *now* (0 = now).
+    limit:
+        Maximum number of log entries per request batch.
+    """
+    now = time.time()
+    start_ns = int((now - since_seconds) * 1_000_000_000)
+    end_ns = int((now - until_seconds) * 1_000_000_000)
+
+    base = loki_url.rstrip("/")
+    fetched = 0
+
+    while True:
+        params = urllib.parse.urlencode(
+            {
+                "query": query,
+                "start": str(start_ns),
+                "end": str(end_ns),
+                "limit": str(limit),
+                "direction": "FORWARD",
+            }
+        )
+        url = f"{base}/loki/api/v1/query_range?{params}"
+        LOG.debug("Loki request: %s", url)
+
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError) as exc:
+            LOG.error("Failed to query Loki at %s: %s", loki_url, exc)
+            return
+
+        status = body.get("status")
+        if status != "success":
+            LOG.error("Loki query failed (status=%s): %s", status, body)
+            return
+
+        streams = body.get("data", {}).get("result", [])
+        batch_count = 0
+        last_ts: int | None = None
+
+        for stream in streams:
+            for ts_str, line in stream.get("values", []):
+                fetched += 1
+                batch_count += 1
+                last_ts = int(ts_str)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield fetched, json.loads(line)
+                except json.JSONDecodeError as exc:
+                    LOG.warning("Skipping malformed JSON from Loki (entry %d): %s", fetched, exc)
+
+        # If we got fewer entries than the limit, we've exhausted the range.
+        if batch_count < limit:
+            break
+
+        # Otherwise paginate forward: start just after the last timestamp.
+        if last_ts is not None:
+            start_ns = last_ts + 1
+        else:
+            break
+
+    LOG.debug("Fetched %d log entries from Loki", fetched)
+
+
 def parse_flows(
     path: str,
     label_keys: list[str],
     verdicts: set[str],
     namespaces: set[str],
+    *,
+    flow_iter: Iterator[tuple[int, dict[str, Any]]] | None = None,
 ) -> ParseResult:
     """Parse Hubble flows into per-workload rule sets.
 
@@ -410,7 +515,8 @@ def parse_flows(
     app_pods: defaultdict[PolicyKey, set[tuple[str, str]]] = defaultdict(set)
     total = matched = 0
 
-    for _lineno, flow in _read_flows(path):
+    source = flow_iter if flow_iter is not None else _read_flows(path)
+    for _lineno, flow in source:
         total += 1
 
         # Support the {"flow": {...}} envelope used by some Hubble versions.
@@ -1468,6 +1574,13 @@ Interactive flow selection (press s in watch mode):
   %(prog)s --watch --output-dir policies/
   # inside TUI: s to select, j/k to move, Space to toggle, Enter to generate
   %(prog)s --watch --dry-run   # preview selected policies on stdout
+
+Loki backend (query flows stored in Grafana Loki):
+
+  %(prog)s --from loki --loki-url http://loki:3100 --dry-run
+  %(prog)s --from loki --loki-url http://loki:3100 -n kube-system -o policies/
+  %(prog)s --from loki --loki-url http://loki:3100 --since 2h --until 30m
+  %(prog)s --from loki --loki-url http://loki:3100 --loki-query '{namespace="hubble"}'
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1591,6 +1704,50 @@ Interactive flow selection (press s in watch mode):
             "you deliberately want to work offline."
         ),
     )
+
+    # --- Loki backend ---
+    loki_group = parser.add_argument_group(
+        "Loki backend",
+        "Fetch flows from a Grafana Loki instance instead of a local file.",
+    )
+    loki_group.add_argument(
+        "--from",
+        dest="source",
+        choices=["file", "loki"],
+        default="file",
+        help="Flow source backend (default: file)",
+    )
+    loki_group.add_argument(
+        "--loki-url",
+        metavar="URL",
+        help="Loki base URL, e.g. http://loki:3100",
+    )
+    loki_group.add_argument(
+        "--loki-query",
+        default='{app="hubble"}',
+        metavar="LOGQL",
+        help='LogQL stream selector (default: {app="hubble"})',
+    )
+    loki_group.add_argument(
+        "--since",
+        default="1h",
+        metavar="DURATION",
+        help="How far back to query, e.g. 30m, 2h, 1d (default: 1h)",
+    )
+    loki_group.add_argument(
+        "--until",
+        default="0s",
+        metavar="DURATION",
+        help="End of query window as duration before now (default: 0s = now)",
+    )
+    loki_group.add_argument(
+        "--loki-limit",
+        type=int,
+        default=5000,
+        metavar="N",
+        help="Max entries per Loki request batch (default: 5000)",
+    )
+
     parser.add_argument(
         "-v",
         "--verbose",
@@ -1620,20 +1777,36 @@ def main() -> None:
         _watch_mode(args)
         return
 
-    if not args.flows_file:
-        parser.error("flows_file is required unless --watch is used")
-
-    if not os.path.isfile(args.flows_file):
-        LOG.error("Flows file not found: %s", args.flows_file)
-        sys.exit(EXIT_ERROR)
-
     verdicts: set[str] = {v.upper() for v in args.verdict} if args.verdict else set()
     namespaces = set(args.namespaces or [])
     label_keys = args.label_keys or DEFAULT_LABEL_KEYS
 
-    policies, flow_counts, total, matched, app_pods = parse_flows(
-        args.flows_file, label_keys, verdicts, namespaces
-    )
+    # --- Select flow source ---
+    if args.source == "loki":
+        if not args.loki_url:
+            parser.error("--loki-url is required when using --from loki")
+        since_sec = _parse_duration(args.since)
+        until_sec = _parse_duration(args.until)
+        loki_iter = _read_flows_loki(
+            args.loki_url, args.loki_query, since_sec, until_sec, args.loki_limit
+        )
+        print(
+            f"Querying Loki at {args.loki_url} "
+            f"(query={args.loki_query!r}, since={args.since}, until={args.until}) ...",
+            file=sys.stderr,
+        )
+        policies, flow_counts, total, matched, app_pods = parse_flows(
+            "", label_keys, verdicts, namespaces, flow_iter=loki_iter
+        )
+    else:
+        if not args.flows_file:
+            parser.error("flows_file is required unless --watch or --from loki is used")
+        if not os.path.isfile(args.flows_file):
+            LOG.error("Flows file not found: %s", args.flows_file)
+            sys.exit(EXIT_ERROR)
+        policies, flow_counts, total, matched, app_pods = parse_flows(
+            args.flows_file, label_keys, verdicts, namespaces
+        )
 
     # --- Detect unidentified endpoints ---
     unknown_keys = _find_unknown_flows(flow_counts)

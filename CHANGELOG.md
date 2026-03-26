@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-26
+
+### Added
+
+- Loki backend: query Hubble flows directly from a Grafana Loki instance with `--from loki --loki-url`.
+- New flags: `--loki-query`, `--since`, `--until`, `--loki-limit` for controlling Loki queries.
+- `parse_flows()` accepts an optional `flow_iter` keyword argument, decoupling flow ingestion from file I/O.
+- Tests for duration parsing, Loki HTTP interaction (mocked), pagination, and end-to-end Loki-to-policy generation.
+
 ## [0.4.1] - 2026-03-21
 
 ### Changed
