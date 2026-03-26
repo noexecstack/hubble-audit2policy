@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import tempfile
 from collections import Counter, defaultdict
 from typing import Any
+from unittest import mock
 
 import hubble_audit2policy as h
 
@@ -207,3 +209,277 @@ class TestWritePolicyDir:
         with tempfile.TemporaryDirectory() as tmpdir:
             written = h._write_policy_dir(sorted_policies, tmpdir)
             assert written == 0
+
+
+class TestParseDuration:
+    def test_seconds(self) -> None:
+        assert h._parse_duration("30s") == 30.0
+
+    def test_minutes(self) -> None:
+        assert h._parse_duration("5m") == 300.0
+
+    def test_hours(self) -> None:
+        assert h._parse_duration("2h") == 7200.0
+
+    def test_days(self) -> None:
+        assert h._parse_duration("1d") == 86400.0
+
+    def test_bare_number_as_seconds(self) -> None:
+        assert h._parse_duration("3600") == 3600.0
+
+    def test_whitespace_tolerance(self) -> None:
+        assert h._parse_duration("  10m  ") == 600.0
+
+    def test_invalid_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            h._parse_duration("abc")
+
+    def test_fractional(self) -> None:
+        assert h._parse_duration("1.5h") == 5400.0
+
+
+class TestParseFlowsWithIterator:
+    """parse_flows accepts a flow_iter to decouple from file I/O."""
+
+    def test_flow_iter_bypasses_file(self) -> None:
+        flow = _make_flow(port=80)
+        it = iter([(1, flow)])
+        policies, _, total, matched, _ = h.parse_flows(
+            "", LABEL_KEYS, set(), set(), flow_iter=it
+        )
+        assert total == 1
+        assert matched == 1
+        assert len(policies) > 0
+
+    def test_flow_iter_envelope_unwrap(self) -> None:
+        inner = _make_flow(port=443)
+        it = iter([(1, {"flow": inner})])
+        policies, _, total, matched, _ = h.parse_flows(
+            "", LABEL_KEYS, set(), set(), flow_iter=it
+        )
+        assert total == 1
+        assert matched == 1
+
+    def test_flow_iter_empty(self) -> None:
+        it = iter([])
+        policies, _, total, matched, _ = h.parse_flows(
+            "", LABEL_KEYS, set(), set(), flow_iter=it
+        )
+        assert total == 0
+        assert len(policies) == 0
+
+
+class TestReadFlowsLoki:
+    """Test _read_flows_loki with mocked HTTP responses."""
+
+    @staticmethod
+    def _loki_response(flows: list[dict[str, Any]]) -> bytes:
+        """Build a minimal Loki query_range JSON response."""
+        values = [[str(i * 1_000_000_000), json.dumps(f)] for i, f in enumerate(flows, 1)]
+        body = {
+            "status": "success",
+            "data": {"result": [{"stream": {}, "values": values}]},
+        }
+        return json.dumps(body).encode()
+
+    def test_basic_fetch(self) -> None:
+        flows = [_make_flow(port=80), _make_flow(port=443)]
+        resp_bytes = self._loki_response(flows)
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = resp_bytes
+            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.Mock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            assert len(result) == 2
+            assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
+            assert result[1][1]["l4"]["TCP"]["destination_port"] == 443
+
+    def test_error_response(self) -> None:
+        body = json.dumps({"status": "error", "message": "bad query"}).encode()
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = body
+            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.Mock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            assert len(result) == 0
+
+    def test_connection_error(self) -> None:
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_open.side_effect = OSError("connection refused")
+            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            assert len(result) == 0
+
+    def test_malformed_json_skipped(self) -> None:
+        values = [
+            ["1000000000", json.dumps(_make_flow(port=80))],
+            ["2000000000", "NOT-JSON"],
+            ["3000000000", json.dumps(_make_flow(port=443))],
+        ]
+        body = json.dumps({
+            "status": "success",
+            "data": {"result": [{"stream": {}, "values": values}]},
+        }).encode()
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = body
+            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.Mock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            assert len(result) == 2
+
+    def test_pagination(self) -> None:
+        """When a batch returns exactly `limit` entries, a follow-up request is made."""
+        flow_a = _make_flow(port=80)
+        flow_b = _make_flow(port=443)
+
+        page1 = json.dumps({
+            "status": "success",
+            "data": {"result": [{"stream": {}, "values": [
+                ["1000000000", json.dumps(flow_a)],
+            ]}]},
+        }).encode()
+        page2 = json.dumps({
+            "status": "success",
+            "data": {"result": [{"stream": {}, "values": [
+                ["2000000000", json.dumps(flow_b)],
+            ]}]},
+        }).encode()
+        # Empty final page signals end of data.
+        page3 = json.dumps({
+            "status": "success",
+            "data": {"result": []},
+        }).encode()
+
+        responses = []
+        for page in [page1, page2, page3]:
+            resp = mock.MagicMock()
+            resp.read.return_value = page
+            resp.__enter__ = mock.Mock(return_value=resp)
+            resp.__exit__ = mock.Mock(return_value=False)
+            responses.append(resp)
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_open.side_effect = responses
+            # limit=1 forces pagination after each entry.
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, limit=1)
+            )
+            assert len(result) == 2
+            assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
+            assert result[1][1]["l4"]["TCP"]["destination_port"] == 443
+            # Should have made 3 requests: page1 + page2 + empty page3.
+            assert mock_open.call_count == 3
+
+    def test_multiple_streams(self) -> None:
+        """Loki may return multiple streams; all should be consumed."""
+        body = json.dumps({
+            "status": "success",
+            "data": {"result": [
+                {"stream": {"pod": "a"}, "values": [
+                    ["1000000000", json.dumps(_make_flow(port=80))],
+                ]},
+                {"stream": {"pod": "b"}, "values": [
+                    ["2000000000", json.dumps(_make_flow(port=443))],
+                ]},
+            ]},
+        }).encode()
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = body
+            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.Mock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            assert len(result) == 2
+
+    def test_query_params_forwarded(self) -> None:
+        """Verify the LogQL query and direction are included in the request URL."""
+        body = json.dumps({
+            "status": "success",
+            "data": {"result": []},
+        }).encode()
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = body
+            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.Mock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            list(h._read_flows_loki(
+                "http://loki:3100", '{namespace="hubble"}', 7200, 0, limit=100
+            ))
+            req = mock_open.call_args[0][0]
+            url = req.full_url
+            assert "/loki/api/v1/query_range?" in url
+            assert "namespace" in url
+            assert "FORWARD" in url
+
+    def test_empty_log_lines_skipped(self) -> None:
+        body = json.dumps({
+            "status": "success",
+            "data": {"result": [{"stream": {}, "values": [
+                ["1000000000", ""],
+                ["2000000000", "   "],
+                ["3000000000", json.dumps(_make_flow(port=80))],
+            ]}]},
+        }).encode()
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = body
+            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.Mock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            assert len(result) == 1
+
+
+class TestLokiEndToEnd:
+    """End-to-end: Loki response -> parse_flows -> policies."""
+
+    def test_loki_flows_produce_policies(self) -> None:
+        flows = [
+            _make_flow(src_app="web", dst_app="api", port=8080),
+            _make_flow(src_app="api", dst_app="db", port=5432),
+        ]
+        values = [[str(i * 1_000_000_000), json.dumps(f)] for i, f in enumerate(flows, 1)]
+        body = json.dumps({
+            "status": "success",
+            "data": {"result": [{"stream": {}, "values": values}]},
+        }).encode()
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = body
+            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_resp.__exit__ = mock.Mock(return_value=False)
+            mock_open.return_value = mock_resp
+
+            loki_iter = h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0)
+            policies, _, total, matched, _ = h.parse_flows(
+                "", LABEL_KEYS, set(), set(), flow_iter=loki_iter
+            )
+            assert total == 2
+            assert matched == 2
+            # Should have policies for web, api, and db.
+            apps = {app for _, app in policies}
+            assert "web" in apps
+            assert "api" in apps
+            assert "db" in apps

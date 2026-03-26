@@ -113,7 +113,11 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
                     [--report] [--report-only]
                     [-w] [--interval SECONDS] [--window SECONDS]
                     [--hubble-cmd CMD] [--capture-file FILE]
-                    [--no-enrich] [-v] [-V]
+                    [--no-enrich]
+                    [--from {file,loki}] [--loki-url URL]
+                    [--loki-query LOGQL] [--since DURATION]
+                    [--until DURATION] [--loki-limit N]
+                    [-v] [-V]
                     [flows_file]
 ```
 
@@ -133,8 +137,31 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `--hubble-cmd CMD` | Override the hubble observe command for watch mode |
 | `--capture-file FILE` | Record all watch-mode flows to FILE as JSONL for later replay |
 | `--no-enrich` | Skip live cluster enrichment via Cilium endpoints |
+| `--from {file,loki}` | Flow source backend (default: `file`) |
+| `--loki-url URL` | Loki base URL, e.g. `http://loki:3100` |
+| `--loki-query LOGQL` | LogQL stream selector (default: `{app="hubble"}`) |
+| `--since DURATION` | How far back to query, e.g. `30m`, `2h`, `1d` (default: `1h`) |
+| `--until DURATION` | End of query window as duration before now (default: `0s` = now) |
+| `--loki-limit N` | Max entries per Loki request batch (default: `5000`) |
 | `-v, --verbose` | Enable verbose logging |
 | `-V, --version` | Show version and exit |
+
+### Loki backend
+
+Instead of reading flows from a local file, you can query a Grafana Loki instance directly:
+
+```bash
+# Basic usage — all flows from the last hour
+hubble-audit2policy --from loki --loki-url http://loki:3100 --dry-run
+
+# Scoped to a namespace with a custom time window
+hubble-audit2policy --from loki --loki-url http://loki:3100 --since 2h --until 30m -n kube-system -o policies/
+
+# Custom LogQL selector (adjust to match your fluentd labels)
+hubble-audit2policy --from loki --loki-url http://loki:3100 --loki-query '{namespace="hubble"}'
+```
+
+All existing filters (`-n`, `--verdict`, `--label-key`, `--report`, etc.) work identically with the Loki backend. Flows are expected to be JSON-formatted Hubble flow logs (the default format when using fluentd for ingestion).
 
 ## License
 
