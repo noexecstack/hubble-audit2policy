@@ -246,9 +246,7 @@ class TestParseFlowsWithIterator:
     def test_flow_iter_bypasses_file(self) -> None:
         flow = _make_flow(port=80)
         it = iter([(1, flow)])
-        policies, _, total, matched, _ = h.parse_flows(
-            "", LABEL_KEYS, set(), set(), flow_iter=it
-        )
+        policies, _, total, matched, _ = h.parse_flows("", LABEL_KEYS, set(), set(), flow_iter=it)
         assert total == 1
         assert matched == 1
         assert len(policies) > 0
@@ -256,17 +254,13 @@ class TestParseFlowsWithIterator:
     def test_flow_iter_envelope_unwrap(self) -> None:
         inner = _make_flow(port=443)
         it = iter([(1, {"flow": inner})])
-        policies, _, total, matched, _ = h.parse_flows(
-            "", LABEL_KEYS, set(), set(), flow_iter=it
-        )
+        policies, _, total, matched, _ = h.parse_flows("", LABEL_KEYS, set(), set(), flow_iter=it)
         assert total == 1
         assert matched == 1
 
     def test_flow_iter_empty(self) -> None:
         it = iter([])
-        policies, _, total, matched, _ = h.parse_flows(
-            "", LABEL_KEYS, set(), set(), flow_iter=it
-        )
+        policies, _, total, matched, _ = h.parse_flows("", LABEL_KEYS, set(), set(), flow_iter=it)
         assert total == 0
         assert len(policies) == 0
 
@@ -325,10 +319,12 @@ class TestReadFlowsLoki:
             ["2000000000", "NOT-JSON"],
             ["3000000000", json.dumps(_make_flow(port=443))],
         ]
-        body = json.dumps({
-            "status": "success",
-            "data": {"result": [{"stream": {}, "values": values}]},
-        }).encode()
+        body = json.dumps(
+            {
+                "status": "success",
+                "data": {"result": [{"stream": {}, "values": values}]},
+            }
+        ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_resp = mock.MagicMock()
@@ -345,23 +341,43 @@ class TestReadFlowsLoki:
         flow_a = _make_flow(port=80)
         flow_b = _make_flow(port=443)
 
-        page1 = json.dumps({
-            "status": "success",
-            "data": {"result": [{"stream": {}, "values": [
-                ["1000000000", json.dumps(flow_a)],
-            ]}]},
-        }).encode()
-        page2 = json.dumps({
-            "status": "success",
-            "data": {"result": [{"stream": {}, "values": [
-                ["2000000000", json.dumps(flow_b)],
-            ]}]},
-        }).encode()
+        page1 = json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "stream": {},
+                            "values": [
+                                ["1000000000", json.dumps(flow_a)],
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
+        page2 = json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "stream": {},
+                            "values": [
+                                ["2000000000", json.dumps(flow_b)],
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
         # Empty final page signals end of data.
-        page3 = json.dumps({
-            "status": "success",
-            "data": {"result": []},
-        }).encode()
+        page3 = json.dumps(
+            {
+                "status": "success",
+                "data": {"result": []},
+            }
+        ).encode()
 
         responses = []
         for page in [page1, page2, page3]:
@@ -385,17 +401,27 @@ class TestReadFlowsLoki:
 
     def test_multiple_streams(self) -> None:
         """Loki may return multiple streams; all should be consumed."""
-        body = json.dumps({
-            "status": "success",
-            "data": {"result": [
-                {"stream": {"pod": "a"}, "values": [
-                    ["1000000000", json.dumps(_make_flow(port=80))],
-                ]},
-                {"stream": {"pod": "b"}, "values": [
-                    ["2000000000", json.dumps(_make_flow(port=443))],
-                ]},
-            ]},
-        }).encode()
+        body = json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "stream": {"pod": "a"},
+                            "values": [
+                                ["1000000000", json.dumps(_make_flow(port=80))],
+                            ],
+                        },
+                        {
+                            "stream": {"pod": "b"},
+                            "values": [
+                                ["2000000000", json.dumps(_make_flow(port=443))],
+                            ],
+                        },
+                    ]
+                },
+            }
+        ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_resp = mock.MagicMock()
@@ -409,10 +435,12 @@ class TestReadFlowsLoki:
 
     def test_query_params_forwarded(self) -> None:
         """Verify the LogQL query and direction are included in the request URL."""
-        body = json.dumps({
-            "status": "success",
-            "data": {"result": []},
-        }).encode()
+        body = json.dumps(
+            {
+                "status": "success",
+                "data": {"result": []},
+            }
+        ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_resp = mock.MagicMock()
@@ -421,9 +449,7 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            list(h._read_flows_loki(
-                "http://loki:3100", '{namespace="hubble"}', 7200, 0, limit=100
-            ))
+            list(h._read_flows_loki("http://loki:3100", '{namespace="hubble"}', 7200, 0, limit=100))
             req = mock_open.call_args[0][0]
             url = req.full_url
             assert "/loki/api/v1/query_range?" in url
@@ -431,14 +457,23 @@ class TestReadFlowsLoki:
             assert "FORWARD" in url
 
     def test_empty_log_lines_skipped(self) -> None:
-        body = json.dumps({
-            "status": "success",
-            "data": {"result": [{"stream": {}, "values": [
-                ["1000000000", ""],
-                ["2000000000", "   "],
-                ["3000000000", json.dumps(_make_flow(port=80))],
-            ]}]},
-        }).encode()
+        body = json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "stream": {},
+                            "values": [
+                                ["1000000000", ""],
+                                ["2000000000", "   "],
+                                ["3000000000", json.dumps(_make_flow(port=80))],
+                            ],
+                        }
+                    ]
+                },
+            }
+        ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_resp = mock.MagicMock()
@@ -460,10 +495,12 @@ class TestLokiEndToEnd:
             _make_flow(src_app="api", dst_app="db", port=5432),
         ]
         values = [[str(i * 1_000_000_000), json.dumps(f)] for i, f in enumerate(flows, 1)]
-        body = json.dumps({
-            "status": "success",
-            "data": {"result": [{"stream": {}, "values": values}]},
-        }).encode()
+        body = json.dumps(
+            {
+                "status": "success",
+                "data": {"result": [{"stream": {}, "values": values}]},
+            }
+        ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_resp = mock.MagicMock()
