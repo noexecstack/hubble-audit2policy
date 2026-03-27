@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-03-27
+
+### Added
+
+- Loki authentication: Basic auth (`--loki-user` / `--loki-password`), Bearer token (`--loki-token`), and custom TLS CA certificate (`--loki-tls-ca`).
+- Mutual exclusivity validation for `--loki-token` and `--loki-user`.
+
+### Fixed
+
+- Add missing `import urllib.error` (was resolved implicitly at runtime).
+
+## [0.6.0] - 2026-03-27
+
+### Changed
+
+- Rewrite README to highlight live and Loki flow sources.
+
 ## [0.5.1] - 2026-03-26
 
 ### Fixed
