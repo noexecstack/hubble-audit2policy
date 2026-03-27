@@ -1,13 +1,15 @@
 # hubble-audit2policy
 
-Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/) YAML from [Hubble](https://github.com/cilium/hubble) flow logs.
+Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/) YAML from observed Hubble traffic -- no manual flow capture required.
 
-Built for platform engineers, SREs, and security engineers who need to bootstrap or audit Kubernetes network policies from real observed traffic rather than guessing. Parses Hubble JSON flow logs (JSONL or JSON array) and produces per-workload CiliumNetworkPolicy files with ingress and egress rules. Supports offline file-based generation and a live watch mode with an interactive TUI.
+Point it at your cluster and get policies. The tool connects to [Hubble](https://github.com/cilium/hubble) directly, queries [Grafana Loki](https://grafana.com/oss/loki/), or reads a file you already have. It produces per-workload CiliumNetworkPolicy files with ingress and egress rules, enriched with real Cilium endpoint labels.
+
+Built for platform engineers, SREs, and security engineers who need to bootstrap or audit Kubernetes network policies from real observed traffic rather than guessing.
 
 ## Installation
 
 ```bash
-pip install .
+pip install hubble-audit2policy
 ```
 
 For development (includes pytest, ruff, mypy):
@@ -18,70 +20,89 @@ pip install -e ".[dev]"
 
 ## Quick Start
 
-### 1. Capture flows with Hubble
+### One command, three ways to get flows
+
+Pick whichever fits your setup -- the tool handles the rest:
+
+**Live from the cluster** -- auto-detects Hubble, streams flows, shows an interactive TUI:
 
 ```bash
-# Single namespace:
-hubble observe -P -n <namespace> --verdict AUDIT -o json -f > <namespace>-flows.json
-
-# All namespaces:
-hubble observe -P --all-namespaces --verdict AUDIT -o json -f > cluster-flows.json
+hubble-audit2policy --watch -o policies/
 ```
 
-### 2. Generate policies
+**From Grafana Loki** -- queries your existing log pipeline, no port-forwarding needed:
 
 ```bash
-# Write per-workload YAML files to a directory:
-./hubble_audit2policy.py flows.json -o policies/
-
-# Preview to stdout without writing files:
-./hubble_audit2policy.py flows.json --dry-run
-
-# Write all policies to a single multi-document YAML file:
-./hubble_audit2policy.py flows.json --single-file policies/all.yaml
-
-# Filter by namespace:
-./hubble_audit2policy.py flows.json -n monitoring -n default -o policies/
-
-# Print a flow frequency report:
-./hubble_audit2policy.py flows.json --report
+hubble-audit2policy --from loki --loki-url http://loki:3100 -o policies/
 ```
 
-### 3. Live watch mode
-
-Watch mode spawns `hubble observe` internally and continuously refreshes a flow-frequency report in a curses-based TUI. No separate terminal needed.
+**From a file** -- if you already have exported flows:
 
 ```bash
-# All namespaces, auto-detect hubble:
-./hubble_audit2policy.py --watch
+hubble-audit2policy flows.json -o policies/
+```
 
-# Single namespace, 5s refresh, rolling 2-minute window:
-./hubble_audit2policy.py --watch -n default --interval 5 --window 120
+All three produce the same output: one CiliumNetworkPolicy YAML per workload.
 
-# Seed from an existing file, then follow live:
-./hubble_audit2policy.py flows.json --watch
+### Common options
 
-# Custom hubble command (e.g. kubectl exec):
-./hubble_audit2policy.py --watch --hubble-cmd 'kubectl exec -n kube-system cilium-xyz -- hubble observe'
+```bash
+# Preview policies on stdout without writing files:
+hubble-audit2policy --watch --dry-run
+
+# Write all policies into a single multi-document YAML:
+hubble-audit2policy --from loki --loki-url http://loki:3100 --single-file policies/all.yaml
+
+# Scope to specific namespaces:
+hubble-audit2policy --watch -n monitoring -n default -o policies/
+
+# Print a flow frequency report (works with any source):
+hubble-audit2policy --watch --report
+hubble-audit2policy flows.json --report-only
+```
+
+## Live Watch Mode
+
+Watch mode spawns `hubble observe` internally and continuously refreshes a flow-frequency report in a curses-based TUI. No separate terminal or manual capture needed -- just run:
+
+```bash
+hubble-audit2policy --watch
 ```
 
 Hubble is auto-detected: the `hubble` binary on PATH is tried first (with `-P` for port-forwarding), falling back to `kubectl exec` into a Cilium DaemonSet pod.
 
-**Capture while watching** for later replay:
+### Useful watch options
 
 ```bash
-./hubble_audit2policy.py --watch --capture-file session.jsonl
-./hubble_audit2policy.py session.jsonl -o policies/
+# Single namespace, 5s refresh, rolling 2-minute window:
+hubble-audit2policy --watch -n default --interval 5 --window 120
+
+# Seed from an existing file, then follow live:
+hubble-audit2policy flows.json --watch
+
+# Custom hubble command (e.g. kubectl exec):
+hubble-audit2policy --watch --hubble-cmd 'kubectl exec -n kube-system cilium-xyz -- hubble observe'
 ```
 
-**Interactive flow selection** — press `s` in watch mode to enter select mode, pick the flows you care about, then press `Enter` to generate policies from just those flows:
+### Capture and replay
+
+Record live flows for later replay or sharing:
 
 ```bash
-./hubble_audit2policy.py --watch --output-dir policies/
-./hubble_audit2policy.py --watch --dry-run   # preview selected policies on stdout
+hubble-audit2policy --watch --capture-file session.jsonl
+hubble-audit2policy session.jsonl -o policies/
 ```
 
-#### Watch mode keys
+### Interactive flow selection
+
+Press `s` in watch mode to enter select mode, pick the flows you care about, then press `Enter` to generate policies from just those flows:
+
+```bash
+hubble-audit2policy --watch --output-dir policies/
+hubble-audit2policy --watch --dry-run   # preview selected policies on stdout
+```
+
+### Watch mode keys
 
 | Key | Action |
 |-----|--------|
@@ -94,6 +115,23 @@ Hubble is auto-detected: the `hubble` binary on PATH is tried first (with `-P` f
 | `Esc` | Exit select mode and clear selections |
 | `q / Ctrl-C` | Quit (last report is printed to the terminal) |
 
+## Loki Backend
+
+Query a Grafana Loki instance directly -- ideal when Hubble flows are already being shipped to Loki via fluentd or another collector:
+
+```bash
+# All flows from the last hour:
+hubble-audit2policy --from loki --loki-url http://loki:3100 --dry-run
+
+# Scoped to a namespace with a custom time window:
+hubble-audit2policy --from loki --loki-url http://loki:3100 --since 2h --until 30m -n kube-system -o policies/
+
+# Custom LogQL selector (adjust to match your labels):
+hubble-audit2policy --from loki --loki-url http://loki:3100 --loki-query '{namespace="hubble"}'
+```
+
+All existing filters (`-n`, `--verdict`, `--label-key`, `--report`, etc.) work identically with the Loki backend.
+
 ## Cluster Enrichment
 
 By default the tool queries `cilium endpoint list` and `cilium endpoint get` on each Cilium DaemonSet pod to resolve the authoritative security-relevant labels for every workload seen in the flows. This produces accurate `endpointSelector` and `matchLabels` in the generated policies instead of a simple `app` label fallback.
@@ -101,10 +139,10 @@ By default the tool queries `cilium endpoint list` and `cilium endpoint get` on 
 Requires `kubectl` access. Skip it when working offline:
 
 ```bash
-./hubble_audit2policy.py flows.json -o policies/ --no-enrich
+hubble-audit2policy flows.json -o policies/ --no-enrich
 ```
 
-## Usage
+## Full Flag Reference
 
 ```
 hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
@@ -146,23 +184,6 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `-v, --verbose` | Enable verbose logging |
 | `-V, --version` | Show version and exit |
 
-### Loki backend
-
-Instead of reading flows from a local file, you can query a Grafana Loki instance directly:
-
-```bash
-# Basic usage — all flows from the last hour
-hubble-audit2policy --from loki --loki-url http://loki:3100 --dry-run
-
-# Scoped to a namespace with a custom time window
-hubble-audit2policy --from loki --loki-url http://loki:3100 --since 2h --until 30m -n kube-system -o policies/
-
-# Custom LogQL selector (adjust to match your fluentd labels)
-hubble-audit2policy --from loki --loki-url http://loki:3100 --loki-query '{namespace="hubble"}'
-```
-
-All existing filters (`-n`, `--verdict`, `--label-key`, `--report`, etc.) work identically with the Loki backend. Flows are expected to be JSON-formatted Hubble flow logs (the default format when using fluentd for ingestion).
-
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) for details.
+Apache-2.0 -- see [LICENSE](LICENSE) for details.
