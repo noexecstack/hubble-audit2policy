@@ -13,6 +13,7 @@ __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
 import argparse
+import base64
 import curses
 import io
 import json
@@ -21,10 +22,12 @@ import os
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict, deque
@@ -404,12 +407,34 @@ def _parse_duration(value: str) -> float:
     return num * multipliers[unit]
 
 
+def _build_loki_ssl_context(
+    ca_cert: str | None = None,
+) -> ssl.SSLContext | None:
+    """Return an SSL context for Loki requests, or *None* for defaults.
+
+    Parameters
+    ----------
+    ca_cert:
+        Path to a PEM-encoded CA certificate file for verifying the
+        Loki server certificate (useful for self-signed certs).
+    """
+    if not ca_cert:
+        return None
+    ctx = ssl.create_default_context(cafile=ca_cert)
+    return ctx
+
+
 def _read_flows_loki(
     loki_url: str,
     query: str,
     since_seconds: float,
     until_seconds: float,
     limit: int = 5000,
+    *,
+    loki_user: str | None = None,
+    loki_password: str | None = None,
+    loki_token: str | None = None,
+    loki_tls_ca: str | None = None,
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield *(lineno, flow_dict)* by querying a Loki instance.
 
@@ -425,6 +450,14 @@ def _read_flows_loki(
         End of the query window as seconds before *now* (0 = now).
     limit:
         Maximum number of log entries per request batch.
+    loki_user:
+        Username for HTTP Basic authentication.
+    loki_password:
+        Password for HTTP Basic authentication.
+    loki_token:
+        Bearer token for ``Authorization: Bearer ...`` header.
+    loki_tls_ca:
+        Path to a PEM CA certificate for TLS verification.
     """
     now = time.time()
     start_ns = int((now - since_seconds) * 1_000_000_000)
@@ -432,6 +465,16 @@ def _read_flows_loki(
 
     base = loki_url.rstrip("/")
     fetched = 0
+
+    # Build auth header (if any).
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if loki_token:
+        headers["Authorization"] = f"Bearer {loki_token}"
+    elif loki_user:
+        cred = base64.b64encode(f"{loki_user}:{loki_password or ''}".encode()).decode("ascii")
+        headers["Authorization"] = f"Basic {cred}"
+
+    ssl_ctx = _build_loki_ssl_context(loki_tls_ca)
 
     while True:
         params = urllib.parse.urlencode(
@@ -446,9 +489,9 @@ def _read_flows_loki(
         url = f"{base}/loki/api/v1/query_range?{params}"
         LOG.debug("Loki request: %s", url)
 
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError) as exc:
             LOG.error("Failed to query Loki at %s: %s", loki_url, exc)
@@ -1747,6 +1790,26 @@ Loki backend (query flows stored in Grafana Loki):
         metavar="N",
         help="Max entries per Loki request batch (default: 5000)",
     )
+    loki_group.add_argument(
+        "--loki-user",
+        metavar="USER",
+        help="Username for Loki HTTP Basic authentication",
+    )
+    loki_group.add_argument(
+        "--loki-password",
+        metavar="PASSWORD",
+        help="Password for Loki HTTP Basic authentication (used with --loki-user)",
+    )
+    loki_group.add_argument(
+        "--loki-token",
+        metavar="TOKEN",
+        help="Bearer token for Loki (Authorization: Bearer ...) header",
+    )
+    loki_group.add_argument(
+        "--loki-tls-ca",
+        metavar="PATH",
+        help="Path to a PEM CA certificate for verifying the Loki server (self-signed certs)",
+    )
 
     parser.add_argument(
         "-v",
@@ -1785,10 +1848,22 @@ def main() -> None:
     if args.source == "loki":
         if not args.loki_url:
             parser.error("--loki-url is required when using --from loki")
+        if args.loki_token and args.loki_user:
+            parser.error("--loki-token and --loki-user are mutually exclusive")
+        if args.loki_password and not args.loki_user:
+            parser.error("--loki-password requires --loki-user")
         since_sec = _parse_duration(args.since)
         until_sec = _parse_duration(args.until)
         loki_iter = _read_flows_loki(
-            args.loki_url, args.loki_query, since_sec, until_sec, args.loki_limit
+            args.loki_url,
+            args.loki_query,
+            since_sec,
+            until_sec,
+            args.loki_limit,
+            loki_user=args.loki_user,
+            loki_password=args.loki_password,
+            loki_token=args.loki_token,
+            loki_tls_ca=args.loki_tls_ca,
         )
         print(
             f"Querying Loki at {args.loki_url} "
