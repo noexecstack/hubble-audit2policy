@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import tempfile
@@ -520,3 +521,124 @@ class TestLokiEndToEnd:
             assert "web" in apps
             assert "api" in apps
             assert "db" in apps
+
+
+class TestLokiAuth:
+    """Test Loki authentication modes in _read_flows_loki."""
+
+    @staticmethod
+    def _empty_loki_response() -> bytes:
+        return json.dumps({"status": "success", "data": {"result": []}}).encode()
+
+    def _mock_urlopen(self) -> mock.MagicMock:
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = self._empty_loki_response()
+        mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
+        mock_resp.__exit__ = mock.Mock(return_value=False)
+        return mock_resp
+
+    def test_bearer_token(self) -> None:
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_open.return_value = self._mock_urlopen()
+            list(
+                h._read_flows_loki(
+                    "http://loki:3100",
+                    '{app="hubble"}',
+                    3600,
+                    0,
+                    loki_token="my-secret-token",
+                )
+            )
+            req = mock_open.call_args[0][0]
+            assert req.get_header("Authorization") == "Bearer my-secret-token"
+
+    def test_basic_auth(self) -> None:
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_open.return_value = self._mock_urlopen()
+            list(
+                h._read_flows_loki(
+                    "http://loki:3100",
+                    '{app="hubble"}',
+                    3600,
+                    0,
+                    loki_user="admin",
+                    loki_password="s3cret",
+                )
+            )
+            req = mock_open.call_args[0][0]
+            expected = "Basic " + base64.b64encode(b"admin:s3cret").decode("ascii")
+            assert req.get_header("Authorization") == expected
+
+    def test_basic_auth_no_password(self) -> None:
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_open.return_value = self._mock_urlopen()
+            list(
+                h._read_flows_loki(
+                    "http://loki:3100",
+                    '{app="hubble"}',
+                    3600,
+                    0,
+                    loki_user="admin",
+                )
+            )
+            req = mock_open.call_args[0][0]
+            expected = "Basic " + base64.b64encode(b"admin:").decode("ascii")
+            assert req.get_header("Authorization") == expected
+
+    def test_no_auth_header_by_default(self) -> None:
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_open.return_value = self._mock_urlopen()
+            list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            req = mock_open.call_args[0][0]
+            assert req.get_header("Authorization") is None
+
+    def test_tls_ca_cert(self) -> None:
+        with (
+            mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open,
+            mock.patch("hubble_audit2policy.ssl.create_default_context") as mock_ctx,
+        ):
+            mock_open.return_value = self._mock_urlopen()
+            list(
+                h._read_flows_loki(
+                    "https://loki:3100",
+                    '{app="hubble"}',
+                    3600,
+                    0,
+                    loki_tls_ca="/path/to/ca.pem",
+                )
+            )
+            mock_ctx.assert_called_once_with(cafile="/path/to/ca.pem")
+            # The context should be passed to urlopen.
+            _, kwargs = mock_open.call_args
+            assert kwargs.get("context") is mock_ctx.return_value
+
+    def test_tls_ca_with_bearer(self) -> None:
+        """TLS CA and bearer token can be combined."""
+        with (
+            mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open,
+            mock.patch("hubble_audit2policy.ssl.create_default_context") as mock_ctx,
+        ):
+            mock_open.return_value = self._mock_urlopen()
+            list(
+                h._read_flows_loki(
+                    "https://loki:3100",
+                    '{app="hubble"}',
+                    3600,
+                    0,
+                    loki_token="tok",
+                    loki_tls_ca="/path/to/ca.pem",
+                )
+            )
+            req = mock_open.call_args[0][0]
+            assert req.get_header("Authorization") == "Bearer tok"
+            mock_ctx.assert_called_once_with(cafile="/path/to/ca.pem")
+
+    def test_build_loki_ssl_context_none(self) -> None:
+        assert h._build_loki_ssl_context(None) is None
+        assert h._build_loki_ssl_context("") is None
+
+    def test_build_loki_ssl_context_returns_ctx(self) -> None:
+        with mock.patch("hubble_audit2policy.ssl.create_default_context") as mock_ctx:
+            ctx = h._build_loki_ssl_context("/path/to/ca.pem")
+            mock_ctx.assert_called_once_with(cafile="/path/to/ca.pem")
+            assert ctx is mock_ctx.return_value
