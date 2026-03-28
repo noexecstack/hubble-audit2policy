@@ -33,6 +33,7 @@ hubble-audit2policy = "hubble_audit2policy:main"
 
 [project.urls]
 Homepage = "https://github.com/noexecstack/hubble-audit2policy"
+Repository = "https://github.com/noexecstack/hubble-audit2policy"
 Issues = "https://github.com/noexecstack/hubble-audit2policy/issues"
 
 [tool.setuptools.package-data]

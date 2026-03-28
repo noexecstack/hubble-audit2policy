@@ -224,7 +224,7 @@ def _cilium_endpoint_get(cilium_pod: str, endpoint_id: int) -> dict[str, Any] | 
         data: Any = json.loads(raw)
         ep: dict[str, Any] = cast(dict[str, Any], data[0] if isinstance(data, list) else data)
         return ep
-    except (RuntimeError, json.JSONDecodeError) as exc:
+    except (RuntimeError, json.JSONDecodeError, IndexError, KeyError) as exc:
         LOG.warning("cilium endpoint get %d failed on %s: %s", endpoint_id, cilium_pod, exc)
         return None
 
