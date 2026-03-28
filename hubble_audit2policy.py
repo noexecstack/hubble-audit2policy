@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.7.3"
+__version__ = "0.7.4"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -224,7 +224,7 @@ def _cilium_endpoint_get(cilium_pod: str, endpoint_id: int) -> dict[str, Any] | 
         data: Any = json.loads(raw)
         ep: dict[str, Any] = cast(dict[str, Any], data[0] if isinstance(data, list) else data)
         return ep
-    except (RuntimeError, json.JSONDecodeError) as exc:
+    except (RuntimeError, json.JSONDecodeError, IndexError, KeyError) as exc:
         LOG.warning("cilium endpoint get %d failed on %s: %s", endpoint_id, cilium_pod, exc)
         return None
 
