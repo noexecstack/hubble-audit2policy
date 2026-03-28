@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-03-28
+
+### Fixed
+
+- Catch `IndexError` and `KeyError` in `_cilium_endpoint_get` when Cilium returns an empty or unexpected response.
+
+### Changed
+
+- Add `Repository` URL to `pyproject.toml` project URLs.
+- Remove `py.typed` marker and `package-data` config (ineffective for single-file module layout).
+
 ## [0.7.3] - 2026-03-28
 
 ### Fixed
