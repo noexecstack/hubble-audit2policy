@@ -8,13 +8,14 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
 import argparse
 import base64
 import curses
+import dataclasses
 import io
 import json
 import logging
@@ -862,8 +863,8 @@ def _print_summary(total: int, matched: int, policy_count: int, file: IO[str] = 
 
 
 def _trunc(s: str, width: int) -> str:
-    """Truncate *s* to *width* chars, appending '…' when cut."""
-    return (s[: width - 1] + "\u2026") if len(s) > width else s
+    """Truncate *s* to *width* chars, appending ``...`` when cut."""
+    return (s[: width - 3] + "...") if len(s) > width else s
 
 
 def _print_report(
@@ -1167,12 +1168,298 @@ def _build_policies_from_flow_keys(keys: set[FlowKey]) -> dict[PolicyKey, RuleSe
     return dict(policies)
 
 
+@dataclasses.dataclass
+class _ReconnectState:
+    """Mutable state for exponential-backoff reconnection in watch mode."""
+
+    delay: float = 2.0
+    at: float = 0.0
+    _DELAY_INIT: float = dataclasses.field(default=2.0, repr=False)
+    _DELAY_MAX: float = dataclasses.field(default=60.0, repr=False)
+
+    def reset(self) -> None:
+        self.delay = self._DELAY_INIT
+
+    def backoff(self, now: float) -> None:
+        self.at = now + self.delay
+        self.delay = min(self.delay * 2, self._DELAY_MAX)
+
+
+def _handle_key(
+    key: int,
+    *,
+    is_paused: bool,
+    is_selecting: bool,
+    cursor_flow_idx: int,
+    ordered_keys: list[FlowKey],
+    selected_keys: set[FlowKey],
+    scroll_offset: int,
+    is_following: bool,
+    half_page: int,
+    content_lines_len: int,
+) -> tuple[bool | None, bool, bool, int, int, bool, bool]:
+    """Process a single curses key press and return updated TUI state.
+
+    Returns ``(quit_signal, is_paused, is_selecting, cursor_flow_idx,
+    scroll_offset, is_following, generate_flag)``.
+
+    *quit_signal*: ``True`` = quit, ``None`` = key not handled (no-op),
+    ``False`` = handled, continue.
+    """
+    if key in (ord("q"), ord("Q"), 3):  # quit
+        return (True, is_paused, is_selecting, cursor_flow_idx, scroll_offset, is_following, False)
+
+    if key == ord(" "):
+        if is_selecting:  # toggle selection
+            if 0 <= cursor_flow_idx < len(ordered_keys):
+                fk = ordered_keys[cursor_flow_idx]
+                if fk in selected_keys:
+                    selected_keys.discard(fk)
+                else:
+                    selected_keys.add(fk)
+        else:  # pause / resume
+            is_paused = not is_paused
+        return (False, is_paused, is_selecting, cursor_flow_idx, scroll_offset, is_following, False)
+
+    if key in (ord("s"), ord("S")):  # toggle select mode
+        if not is_selecting and not ordered_keys:
+            return (
+                None,
+                is_paused,
+                is_selecting,
+                cursor_flow_idx,
+                scroll_offset,
+                is_following,
+                False,
+            )
+        is_selecting = not is_selecting
+        if is_selecting:
+            cursor_flow_idx = min(cursor_flow_idx, len(ordered_keys) - 1)
+        return (False, is_paused, is_selecting, cursor_flow_idx, scroll_offset, is_following, False)
+
+    if key == 27:  # Esc -- exit select + clear
+        return False, is_paused, False, 0, scroll_offset, is_following, False
+
+    if key in (10, 13, curses.KEY_ENTER):  # Enter -- generate + quit
+        if is_selecting and selected_keys:
+            return (
+                True,
+                is_paused,
+                is_selecting,
+                cursor_flow_idx,
+                scroll_offset,
+                is_following,
+                True,
+            )
+        return (
+            None,
+            is_paused,
+            is_selecting,
+            cursor_flow_idx,
+            scroll_offset,
+            is_following,
+            False,
+        )
+
+    # -- navigation --------------------------------------------------------
+    if key in (ord("j"), curses.KEY_DOWN):
+        if is_selecting and ordered_keys:
+            cursor_flow_idx = min(cursor_flow_idx + 1, len(ordered_keys) - 1)
+        else:
+            scroll_offset += 1
+            is_following = False
+
+    elif key in (ord("k"), curses.KEY_UP):
+        if is_selecting and ordered_keys:
+            cursor_flow_idx = max(0, cursor_flow_idx - 1)
+        else:
+            scroll_offset = max(0, scroll_offset - 1)
+
+    elif key in (ord("d"), curses.KEY_NPAGE):
+        if is_selecting and ordered_keys:
+            cursor_flow_idx = min(cursor_flow_idx + half_page, len(ordered_keys) - 1)
+        else:
+            scroll_offset += half_page
+            is_following = False
+
+    elif key in (ord("u"), curses.KEY_PPAGE):
+        if is_selecting and ordered_keys:
+            cursor_flow_idx = max(0, cursor_flow_idx - half_page)
+        else:
+            scroll_offset = max(0, scroll_offset - half_page)
+
+    elif key in (ord("g"), curses.KEY_HOME):
+        if is_selecting:
+            cursor_flow_idx = 0
+        scroll_offset = 0
+        is_following = True
+
+    elif key in (ord("G"), curses.KEY_END):
+        if is_selecting and ordered_keys:
+            cursor_flow_idx = len(ordered_keys) - 1
+        scroll_offset = content_lines_len  # clamped by caller
+        is_following = False
+
+    else:
+        return (
+            None,
+            is_paused,
+            is_selecting,
+            cursor_flow_idx,
+            scroll_offset,
+            is_following,
+            False,
+        )
+
+    return (
+        False,
+        is_paused,
+        is_selecting,
+        cursor_flow_idx,
+        scroll_offset,
+        is_following,
+        False,
+    )
+
+
+def _draw_header(
+    stdscr: Any,
+    width: int,
+    *,
+    cmd_display: str,
+    interval: float,
+    store: LiveFlowStore,
+    capture_file: str | None,
+    is_paused: bool,
+    is_selecting: bool,
+    selected_count: int,
+    reconn: _ReconnectState,
+    now_mono: float,
+) -> None:
+    """Render the fixed header rows (0-2) of the watch mode TUI."""
+    # Row 0: command + timestamp
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    left = f"Every {interval:.1f}s: {cmd_display}"
+    if len(left) > width - len(now_str) - 2:
+        left = left[: width - len(now_str) - 5] + "..."
+    padding = max(1, width - len(left) - len(now_str))
+    try:
+        stdscr.addnstr(0, 0, f"{left}{' ' * padding}{now_str}", width - 1)
+    except curses.error:
+        pass
+
+    # Row 1: window info + status badge
+    win_label = (
+        f"Window: last {store.window_seconds:.0f}s"
+        if store.window_seconds > 0
+        else "Window: all flows"
+    )
+    cap_note = f"  |  Capturing -> {capture_file}" if capture_file else ""
+    prefix = (
+        f"{win_label}  |  In window: {store.count}"
+        f"  |  Total received: {store.total_received}{cap_note}  "
+    )
+    if is_paused:
+        badge, badge_attr = (
+            "|| PAUSED",
+            curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD,
+        )
+    elif store.connected:
+        badge, badge_attr = (
+            "* Live",
+            curses.color_pair(1) if curses.has_colors() else curses.A_NORMAL,
+        )
+    elif now_mono < reconn.at:
+        secs_left = int(reconn.at - now_mono)
+        badge = f"! Disconnected - reconnecting in {secs_left}s"
+        badge_attr = curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
+    else:
+        badge, badge_attr = (
+            "! Reconnecting...",
+            curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL,
+        )
+    try:
+        stdscr.addnstr(1, 0, prefix, width - 1)
+        stdscr.addnstr(1, len(prefix), badge, width - 1 - len(prefix), badge_attr)
+    except curses.error:
+        pass
+
+    # Row 2: selection hint (select mode) OR last hubble error OR blank
+    if is_selecting:
+        sel_hint = (
+            f"SELECT  Space toggle  Enter generate ({selected_count} selected)"
+            "  j/k move  s/Esc exit"
+        )
+        sel_attr = curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+        try:
+            stdscr.addnstr(2, 0, sel_hint, width - 1, sel_attr)
+        except curses.error:
+            pass
+    elif not store.connected and store.last_error:
+        err_text = f"Last error: {_trunc(store.last_error, width - 13)}"
+        err_attr = curses.color_pair(3) if curses.has_colors() else curses.A_NORMAL
+        try:
+            stdscr.addnstr(2, 0, err_text, width - 1, err_attr)
+        except curses.error:
+            pass
+
+
+def _draw_content(
+    stdscr: Any,
+    width: int,
+    height: int,
+    *,
+    content_lines: list[str],
+    scroll_offset: int,
+    is_selecting: bool,
+    is_following: bool,
+    cursor_flow_idx: int,
+    key_map: dict[int, FlowKey],
+    selected_keys: set[FlowKey],
+    header_lines: int,
+    data_row_offset: int,
+) -> None:
+    """Render the scrollable content area and corner scroll indicator."""
+    content_viewport = max(1, height - header_lines)
+    max_scroll = max(0, len(content_lines) - content_viewport)
+
+    cursor_line = data_row_offset + cursor_flow_idx if is_selecting else -1
+    for i, line in enumerate(content_lines[scroll_offset : scroll_offset + content_viewport]):
+        abs_idx = scroll_offset + i
+        attr = curses.A_NORMAL
+        if is_selecting and abs_idx in key_map:
+            fk = key_map[abs_idx]
+            if fk in selected_keys:
+                attr |= (
+                    curses.color_pair(1) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
+                )
+            if abs_idx == cursor_line:
+                attr |= curses.A_REVERSE
+        try:
+            stdscr.addnstr(header_lines + i, 0, line, width - 1, attr)
+        except curses.error:
+            pass
+
+    # Corner scroll indicator
+    if len(content_lines) > content_viewport:
+        if is_following:
+            indicator = " TOP  j/d v "
+        else:
+            pct = int(100 * scroll_offset / max(1, max_scroll))
+            indicator = f" {pct}%  k/u ^  j/d v  g# "
+        try:
+            col = max(0, width - len(indicator) - 1)
+            stdscr.addnstr(height - 1, col, indicator, width - 1, curses.A_REVERSE)
+        except curses.error:
+            pass
+
+
 def _watch_mode(args: argparse.Namespace) -> None:
     """Live monitoring mode: spawn ``hubble observe`` and refresh the report.
 
     Keys (Mac-primary, all modes):
-      j / ↓     scroll down one line
-      k / ↑     scroll up one line
+      j / down  scroll down one line
+      k / up    scroll up one line
       d         scroll down half a page
       u         scroll up half a page
       g         jump to top / re-enable auto-follow
@@ -1182,7 +1469,7 @@ def _watch_mode(args: argparse.Namespace) -> None:
       s         enter / exit flow-selection mode
       Enter     generate policies from selected flows and quit (select mode)
       Esc       exit select mode and clear selections
-      q / ^C    quit — last report is printed to the terminal
+      q / ^C    quit -- last report is printed to the terminal
 
     PgUp / PgDn / Home / End also work for non-Mac keyboards.
 
@@ -1239,9 +1526,7 @@ def _watch_mode(args: argparse.Namespace) -> None:
         LOG.error("Command not found: %s", hubble_cmd[0])
         sys.exit(EXIT_ERROR)
 
-    _RECONNECT_DELAY_INIT = 2.0
-    _RECONNECT_DELAY_MAX = 60.0
-    reconnect_state = {"delay": _RECONNECT_DELAY_INIT, "at": 0.0}
+    reconn = _ReconnectState()
 
     # Header layout (screen rows):
     #   0  command + timestamp
@@ -1252,13 +1537,15 @@ def _watch_mode(args: argparse.Namespace) -> None:
     HEADER_LINES = 4
 
     # _print_report always writes these many lines before the first data row:
-    #   "" (leading \n), sep, "FLOW REPORT...", sep, header-row, dash  → 6 lines
+    #   "" (leading \n), sep, "FLOW REPORT...", sep, header-row, dash  = 6 lines
     DATA_ROW_OFFSET = 6
 
     # Shared state between _run() and the outer scope.
     final_content: list[str] = []
     generate_flag: bool = False
     selected_keys_final: set[FlowKey] = set()
+
+    capture_file_name: str | None = args.capture_file if capture_fh else None
 
     def _run(stdscr: curses.window) -> None:  # type: ignore[name-defined]
         nonlocal final_content, generate_flag
@@ -1279,7 +1566,7 @@ def _watch_mode(args: argparse.Namespace) -> None:
         selected_keys: set[FlowKey] = set()
 
         ordered_keys: list[FlowKey] = []  # flow keys in display order (rebuilt each refresh)
-        key_map: dict[int, FlowKey] = {}  # content_line_index → FlowKey
+        key_map: dict[int, FlowKey] = {}  # content_line_index -> FlowKey
         content_lines: list[str] = []
         last_refresh = 0.0
 
@@ -1288,76 +1575,37 @@ def _watch_mode(args: argparse.Namespace) -> None:
             height, width = stdscr.getmaxyx()
             half_page = max(1, (height - HEADER_LINES) // 2)
 
-            if key in (ord("q"), ord("Q"), 3):  # quit
-                break
-
-            elif key == ord(" "):
-                if is_selecting:  # toggle selection
-                    if 0 <= cursor_flow_idx < len(ordered_keys):
-                        fk = ordered_keys[cursor_flow_idx]
-                        if fk in selected_keys:
-                            selected_keys.discard(fk)
-                        else:
-                            selected_keys.add(fk)
-                else:  # pause / resume
-                    is_paused = not is_paused
-
-            elif key in (ord("s"), ord("S")):  # toggle select mode
-                if not is_selecting and not ordered_keys:
-                    continue  # nothing to select
-                is_selecting = not is_selecting
-                if is_selecting:
-                    cursor_flow_idx = min(cursor_flow_idx, len(ordered_keys) - 1)
-
-            elif key == 27:  # Esc – exit select + clear
-                is_selecting = False
-                selected_keys.clear()
-                cursor_flow_idx = 0
-
-            elif key in (10, 13, curses.KEY_ENTER):  # Enter – generate + quit
-                if is_selecting and selected_keys:
-                    generate_flag = True
-                    selected_keys_final.update(selected_keys)
+            if key != -1:
+                (
+                    quit_sig,
+                    is_paused,
+                    is_selecting,
+                    cursor_flow_idx,
+                    scroll_offset,
+                    is_following,
+                    gen,
+                ) = _handle_key(
+                    key,
+                    is_paused=is_paused,
+                    is_selecting=is_selecting,
+                    cursor_flow_idx=cursor_flow_idx,
+                    ordered_keys=ordered_keys,
+                    selected_keys=selected_keys,
+                    scroll_offset=scroll_offset,
+                    is_following=is_following,
+                    half_page=half_page,
+                    content_lines_len=len(content_lines),
+                )
+                if quit_sig:
+                    if gen:
+                        generate_flag = True
+                        selected_keys_final.update(selected_keys)
                     break
-
-            # ---- navigation --------------------------------------------------
-            elif key in (ord("j"), curses.KEY_DOWN):
-                if is_selecting and ordered_keys:
-                    cursor_flow_idx = min(cursor_flow_idx + 1, len(ordered_keys) - 1)
-                else:
-                    scroll_offset += 1
-                    is_following = False
-
-            elif key in (ord("k"), curses.KEY_UP):
-                if is_selecting and ordered_keys:
-                    cursor_flow_idx = max(0, cursor_flow_idx - 1)
-                else:
-                    scroll_offset = max(0, scroll_offset - 1)
-
-            elif key in (ord("d"), curses.KEY_NPAGE):
-                if is_selecting and ordered_keys:
-                    cursor_flow_idx = min(cursor_flow_idx + half_page, len(ordered_keys) - 1)
-                else:
-                    scroll_offset += half_page
-                    is_following = False
-
-            elif key in (ord("u"), curses.KEY_PPAGE):
-                if is_selecting and ordered_keys:
-                    cursor_flow_idx = max(0, cursor_flow_idx - half_page)
-                else:
-                    scroll_offset = max(0, scroll_offset - half_page)
-
-            elif key in (ord("g"), curses.KEY_HOME):
-                if is_selecting:
-                    cursor_flow_idx = 0
-                scroll_offset = 0
-                is_following = True
-
-            elif key in (ord("G"), curses.KEY_END):
-                if is_selecting and ordered_keys:
-                    cursor_flow_idx = len(ordered_keys) - 1
-                scroll_offset = len(content_lines)  # clamped below
-                is_following = False
+                # Esc clears selections inside _handle_key via the returned
+                # is_selecting=False, but the set is mutated in-place only for
+                # toggle; for Esc we need to clear here when select was exited.
+                if key == 27:
+                    selected_keys.clear()
 
             now_mono = time.monotonic()
 
@@ -1367,15 +1615,12 @@ def _watch_mode(args: argparse.Namespace) -> None:
 
                 # Auto-reconnect
                 if not store.connected and proc_holder[0].poll() is not None:
-                    if now_mono >= reconnect_state["at"]:
+                    if now_mono >= reconn.at:
                         try:
                             proc_holder[0] = _launch_hubble(hubble_cmd, store, stop_event)
-                            reconnect_state["delay"] = _RECONNECT_DELAY_INIT
+                            reconn.reset()
                         except FileNotFoundError:
-                            reconnect_state["at"] = now_mono + reconnect_state["delay"]
-                            reconnect_state["delay"] = min(
-                                reconnect_state["delay"] * 2, _RECONNECT_DELAY_MAX
-                            )
+                            reconn.backoff(now_mono)
 
                 flows = store.snapshot()
                 _, flow_counts, total, matched, _ = _parse_flow_list(
@@ -1393,8 +1638,8 @@ def _watch_mode(args: argparse.Namespace) -> None:
                     _print_unknown_warnings(unknown_keys, flow_counts, file=buf)
 
                 buf.write(
-                    "\nSpace pause  \u2022  j/k line  \u2022  d/u half-page"
-                    "  \u2022  g/G top/bottom  \u2022  s select  \u2022  q quit\n"
+                    "\nSpace pause  |  j/k line  |  d/u half-page"
+                    "  |  g/G top/bottom  |  s select  |  q quit\n"
                 )
                 content_lines = buf.getvalue().splitlines()
                 final_content = content_lines
@@ -1414,7 +1659,7 @@ def _watch_mode(args: argparse.Namespace) -> None:
             else:
                 scroll_offset = min(scroll_offset, max_scroll)
                 if scroll_offset <= 0:
-                    is_following = True  # scrolled back to top → re-enable
+                    is_following = True  # scrolled back to top -- re-enable
 
             # In selection mode keep the cursor row visible.
             if is_selecting and ordered_keys:
@@ -1425,115 +1670,37 @@ def _watch_mode(args: argparse.Namespace) -> None:
                     elif cursor_line >= scroll_offset + content_viewport:
                         scroll_offset = min(cursor_line - content_viewport + 1, max_scroll)
 
-            # ---- Draw header -------------------------------------------------
+            # ---- Draw --------------------------------------------------------
             stdscr.erase()
-
-            # Row 0: command + timestamp
-            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-            left = f"Every {interval:.1f}s: {cmd_display}"
-            if len(left) > width - len(now_str) - 2:
-                left = left[: width - len(now_str) - 5] + "\u2026"
-            padding = max(1, width - len(left) - len(now_str))
-            try:
-                stdscr.addnstr(0, 0, f"{left}{' ' * padding}{now_str}", width - 1)
-            except curses.error:
-                pass
-
-            # Row 1: window info + status badge
-            win_label = f"Window: last {window:.0f}s" if window > 0 else "Window: all flows"
-            cap_note = f"  •  Capturing → {args.capture_file}" if capture_fh else ""
-            prefix = (
-                f"{win_label}  \u2022  In window: {store.count}"
-                f"  \u2022  Total received: {store.total_received}{cap_note}  "
+            _draw_header(
+                stdscr,
+                width,
+                cmd_display=cmd_display,
+                interval=interval,
+                store=store,
+                capture_file=capture_file_name,
+                is_paused=is_paused,
+                is_selecting=is_selecting,
+                selected_count=len(selected_keys),
+                reconn=reconn,
+                now_mono=now_mono,
             )
-            if is_paused:
-                badge, badge_attr = (
-                    "\u23f8 PAUSED",
-                    (
-                        curses.color_pair(2) | curses.A_BOLD
-                        if curses.has_colors()
-                        else curses.A_BOLD
-                    ),
-                )
-            elif store.connected:
-                badge, badge_attr = (
-                    "\u25cf Live",
-                    (curses.color_pair(1) if curses.has_colors() else curses.A_NORMAL),
-                )
-            elif now_mono < reconnect_state["at"]:
-                secs_left = int(reconnect_state["at"] - now_mono)
-                badge = f"\u26a0 Disconnected \u2013 reconnecting in {secs_left}s"
-                badge_attr = curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
-            else:
-                badge, badge_attr = (
-                    "\u26a0 Reconnecting\u2026",
-                    (curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL),
-                )
-            try:
-                stdscr.addnstr(1, 0, prefix, width - 1)
-                stdscr.addnstr(1, len(prefix), badge, width - 1 - len(prefix), badge_attr)
-            except curses.error:
-                pass
-
-            # Row 2: selection hint (select mode) OR last hubble error OR blank
-            if is_selecting:
-                n_sel = len(selected_keys)
-                sel_hint = (
-                    f"SELECT  Space toggle  Enter generate ({n_sel} selected)  j/k move  s/Esc exit"
-                )
-                sel_attr = (
-                    curses.color_pair(2) | curses.A_BOLD if curses.has_colors() else curses.A_BOLD
-                )
-                try:
-                    stdscr.addnstr(2, 0, sel_hint, width - 1, sel_attr)
-                except curses.error:
-                    pass
-            elif not store.connected and store.last_error:
-                err_text = f"Last error: {_trunc(store.last_error, width - 13)}"
-                err_attr = curses.color_pair(3) if curses.has_colors() else curses.A_NORMAL
-                try:
-                    stdscr.addnstr(2, 0, err_text, width - 1, err_attr)
-                except curses.error:
-                    pass
-            # Row 3 is blank (implicit from erase)
-
-            # ---- Draw scrollable content -------------------------------------
-            cursor_line = DATA_ROW_OFFSET + cursor_flow_idx if is_selecting else -1
-            for i, line in enumerate(
-                content_lines[scroll_offset : scroll_offset + content_viewport]
-            ):
-                abs_idx = scroll_offset + i
-                attr = curses.A_NORMAL
-                if is_selecting and abs_idx in key_map:
-                    fk = key_map[abs_idx]
-                    if fk in selected_keys:
-                        attr |= (
-                            curses.color_pair(1) | curses.A_BOLD
-                            if curses.has_colors()
-                            else curses.A_BOLD
-                        )
-                    if abs_idx == cursor_line:
-                        attr |= curses.A_REVERSE
-                try:
-                    stdscr.addnstr(HEADER_LINES + i, 0, line, width - 1, attr)
-                except curses.error:
-                    pass
-
-            # ---- Corner indicator --------------------------------------------
-            if len(content_lines) > content_viewport:
-                if is_following:
-                    indicator = " TOP  j/d \u2193 "
-                else:
-                    pct = int(100 * scroll_offset / max(1, max_scroll))
-                    indicator = f" {pct}%  k/u \u2191  j/d \u2193  g\u21a5 "
-                try:
-                    col = max(0, width - len(indicator) - 1)
-                    stdscr.addnstr(height - 1, col, indicator, width - 1, curses.A_REVERSE)
-                except curses.error:
-                    pass
-
+            _draw_content(
+                stdscr,
+                width,
+                height,
+                content_lines=content_lines,
+                scroll_offset=scroll_offset,
+                is_selecting=is_selecting,
+                is_following=is_following,
+                cursor_flow_idx=cursor_flow_idx,
+                key_map=key_map,
+                selected_keys=selected_keys,
+                header_lines=HEADER_LINES,
+                data_row_offset=DATA_ROW_OFFSET,
+            )
             stdscr.refresh()
-            time.sleep(0.05)  # ~20 fps – keeps key input responsive
+            time.sleep(0.05)  # ~20 fps -- keeps key input responsive
 
     try:
         curses.wrapper(_run)
@@ -1562,7 +1729,7 @@ def _watch_mode(args: argparse.Namespace) -> None:
         n_pol = len(sorted_policies)
         print(
             f"\nGenerating {n_pol} {'policy' if n_pol == 1 else 'policies'} "
-            f"from {len(selected_keys_final)} selected flows\u2026",
+            f"from {len(selected_keys_final)} selected flows...",
             file=sys.stderr,
         )
         if args.dry_run:

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-03-28
+
+### Changed
+
+- Refactor watch mode: extract `_handle_key`, `_draw_header`, `_draw_content` helpers from 271-line nested `_run` function.
+- Replace `reconnect_state` dict with `_ReconnectState` dataclass for type-safe reconnection state.
+- Replace all Unicode symbols with ASCII equivalents throughout TUI and CLI output.
+
+### Added
+
+- Tests for `_dump_yaml`, `_write_multi_doc_yaml`, `_find_unknown_flows`, `_print_unknown_warnings`, `_print_summary`, `_trunc`, `_print_report`, `_ReconnectState`, and `_handle_key` (39 new tests, 120 total).
+- Error-path tests for `_parse_duration` and `_read_flows`.
+
 ## [0.7.1] - 2026-03-28
 
 ### Fixed
