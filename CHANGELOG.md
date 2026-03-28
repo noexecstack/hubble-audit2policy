@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] - 2026-03-28
+
+### Fixed
+
+- Fix `_ReconnectState` dataclass: promote `_DELAY_INIT` and `_DELAY_MAX` from instance fields to `ClassVar` so they no longer pollute `__init__`, `__eq__`, or `__repr__`.
+- Fix thread-safety gap in `LiveFlowStore.suspend_capture()`: acquire lock when swapping `_capture_fh` to match lock discipline in `add()`.
+- Fix `--capture-file` help text: replace incorrect "Append" wording with "Write" to match actual `"w"` (overwrite) behaviour.
+
+### Changed
+
+- CI lint and typecheck jobs now install from `.[dev]` instead of ad-hoc unpinned `pip install`, ensuring consistent tool versions across all CI jobs.
+- Expand `.gitignore` with common Unix/Linux/IDE entries (vim swap files, `.idea/`, `.tox/`, `.coverage`, `Thumbs.db`, etc.).
+
+### Added
+
+- CLI integration tests (`tests/test_cli.py`): 14 new tests covering dry-run output, output-dir writes, single-file mode, report-only exit code, namespace/verdict filtering, empty/missing file exit codes, and all argument validation paths (134 total).
+
 ## [0.7.4] - 2026-03-28
 
 ### Fixed

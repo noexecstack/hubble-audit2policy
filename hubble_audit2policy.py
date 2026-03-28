@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.7.4"
+__version__ = "0.7.5"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -34,7 +34,7 @@ import urllib.request
 from collections import Counter, defaultdict, deque
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
-from typing import IO, Any, cast
+from typing import IO, Any, ClassVar, cast
 
 import yaml
 
@@ -990,12 +990,14 @@ class LiveFlowStore:
     @contextmanager
     def suspend_capture(self) -> Generator[None, None, None]:
         """Context manager that suppresses flow capture for its duration."""
-        saved = self._capture_fh
-        self._capture_fh = None
+        with self._lock:
+            saved = self._capture_fh
+            self._capture_fh = None
         try:
             yield
         finally:
-            self._capture_fh = saved
+            with self._lock:
+                self._capture_fh = saved
 
     @property
     def count(self) -> int:
@@ -1172,10 +1174,11 @@ def _build_policies_from_flow_keys(keys: set[FlowKey]) -> dict[PolicyKey, RuleSe
 class _ReconnectState:
     """Mutable state for exponential-backoff reconnection in watch mode."""
 
+    _DELAY_INIT: ClassVar[float] = 2.0
+    _DELAY_MAX: ClassVar[float] = 60.0
+
     delay: float = 2.0
     at: float = 0.0
-    _DELAY_INIT: float = dataclasses.field(default=2.0, repr=False)
-    _DELAY_MAX: float = dataclasses.field(default=60.0, repr=False)
 
     def reset(self) -> None:
         self.delay = self._DELAY_INIT
@@ -1905,8 +1908,8 @@ Loki backend (query flows stored in Grafana Loki):
         "--capture-file",
         metavar="FILE",
         help=(
-            "Append all flows received during --watch mode to FILE as JSONL. "
-            "The file is overwritten at the start of each session. "
+            "Write all flows received during --watch mode to FILE as JSONL. "
+            "The file is created (or overwritten) at the start of each session. "
             "Use the file later to generate policies: "
             "%(prog)s FILE -o policies/"
         ),

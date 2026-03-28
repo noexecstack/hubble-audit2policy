@@ -1,12 +1,41 @@
+# macOS
 .DS_Store
+
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
 *.egg-info/
+*.egg
 dist/
 build/
 .venv/
+venv/
+env/
+*.whl
+
+# Editors / IDEs
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+\#*\#
+.project
+.settings/
+
+# Tool caches
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+
+# Claude
 .claude/
+
+# OS artifacts
+Thumbs.db
+Desktop.ini
