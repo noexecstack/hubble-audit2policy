@@ -155,6 +155,8 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
                     [--from {file,loki}] [--loki-url URL]
                     [--loki-query LOGQL] [--since DURATION]
                     [--until DURATION] [--loki-limit N]
+                    [--loki-user USER] [--loki-password PASSWORD]
+                    [--loki-token TOKEN] [--loki-tls-ca PATH]
                     [-v] [-V]
                     [flows_file]
 ```
@@ -181,6 +183,10 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `--since DURATION` | How far back to query, e.g. `30m`, `2h`, `1d` (default: `1h`) |
 | `--until DURATION` | End of query window as duration before now (default: `0s` = now) |
 | `--loki-limit N` | Max entries per Loki request batch (default: `5000`) |
+| `--loki-user USER` | Username for Loki HTTP Basic authentication |
+| `--loki-password PASSWORD` | Password for Loki HTTP Basic authentication (used with `--loki-user`) |
+| `--loki-token TOKEN` | Bearer token for Loki (`Authorization: Bearer ...`) header |
+| `--loki-tls-ca PATH` | Path to a PEM CA certificate for verifying the Loki server (self-signed certs) |
 | `-v, --verbose` | Enable verbose logging |
 | `-V, --version` | Show version and exit |
 
