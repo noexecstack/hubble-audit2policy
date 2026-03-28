@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -1013,7 +1013,7 @@ def _detect_hubble_cmd() -> tuple[list[str], bool]:
     only when appropriate.
     """
     if shutil.which("hubble"):
-        logging.debug("hubble: using PATH binary with -P (auto port-forward)")
+        LOG.debug("hubble: using PATH binary with -P (auto port-forward)")
         return ["hubble", "observe"], True
     # Fall back to kubectl exec into a Cilium pod.
     if shutil.which("kubectl"):
@@ -1021,7 +1021,7 @@ def _detect_hubble_cmd() -> tuple[list[str], bool]:
             cilium_node_map = _build_cilium_node_map()
             if cilium_node_map:
                 cilium_pod = next(iter(sorted(cilium_node_map.values())))
-                logging.debug("hubble: using kubectl exec into %s", cilium_pod)
+                LOG.debug("hubble: using kubectl exec into %s", cilium_pod)
                 return [
                     "kubectl",
                     "exec",
@@ -1075,7 +1075,8 @@ def _hubble_reader_thread(
     stop_event: threading.Event,
 ) -> None:
     """Read JSON flow lines from hubble stdout and feed them into *store*."""
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        return
     for line in proc.stdout:
         if stop_event.is_set():
             break
@@ -1100,7 +1101,8 @@ def _hubble_stderr_thread(
     stop_event: threading.Event,
 ) -> None:
     """Drain hubble stderr and record the last meaningful line in *store*."""
-    assert proc.stderr is not None
+    if proc.stderr is None:
+        return
     for line in proc.stderr:
         if stop_event.is_set():
             break
@@ -1218,6 +1220,8 @@ def _watch_mode(args: argparse.Namespace) -> None:
     try:
         hubble_cmd = _build_hubble_observe_cmd(args)
     except RuntimeError as exc:
+        if capture_fh:
+            capture_fh.close()
         LOG.error("%s", exc)
         sys.exit(EXIT_ERROR)
 
@@ -1230,6 +1234,8 @@ def _watch_mode(args: argparse.Namespace) -> None:
     try:
         proc_holder = [_launch_hubble(hubble_cmd, store, stop_event)]
     except FileNotFoundError:
+        if capture_fh:
+            capture_fh.close()
         LOG.error("Command not found: %s", hubble_cmd[0])
         sys.exit(EXIT_ERROR)
 
@@ -1297,9 +1303,11 @@ def _watch_mode(args: argparse.Namespace) -> None:
                     is_paused = not is_paused
 
             elif key in (ord("s"), ord("S")):  # toggle select mode
+                if not is_selecting and not ordered_keys:
+                    continue  # nothing to select
                 is_selecting = not is_selecting
                 if is_selecting:
-                    cursor_flow_idx = min(cursor_flow_idx, max(0, len(ordered_keys) - 1))
+                    cursor_flow_idx = min(cursor_flow_idx, len(ordered_keys) - 1)
 
             elif key == 27:  # Esc – exit select + clear
                 is_selecting = False

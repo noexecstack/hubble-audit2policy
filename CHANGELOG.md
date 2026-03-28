@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-03-28
+
+### Fixed
+
+- Use module logger (`LOG.debug`) instead of root `logging.debug` in `_detect_hubble_cmd`.
+- Replace `assert` guards in reader threads with early-return checks (assertions are stripped under `python -O`).
+- Guard `cursor_flow_idx` when `ordered_keys` is empty in watch select mode.
+- Close capture file handle on early exit paths to prevent resource leak.
+- Add missing `py.typed` marker file (referenced in CHANGELOG since v0.4.0 but never created).
+- Add `types-PyYAML` to dev dependencies so local `mypy` works without manual installs.
+- Add `.mypy_cache/`, `.pytest_cache/`, `.ruff_cache/` to `.gitignore`.
+
 ## [0.7.0] - 2026-03-27
 
 ### Added
