@@ -77,6 +77,10 @@ hubble-audit2policy --from loki --loki-url http://loki:3100 -n monitoring -n def
 # Custom time window -- last 24 hours:
 hubble-audit2policy --from loki --loki-url http://loki:3100 --since 24h -o policies/
 
+# Absolute time window -- Friday night to Sunday morning:
+hubble-audit2policy --from loki --loki-url http://loki:3100 \
+  --since 2026-03-27T20:00:00 --until 2026-03-29T08:00:00 -o policies/
+
 # Print a flow frequency report (works with any source):
 hubble-audit2policy --from loki --loki-url http://loki:3100 --report
 hubble-audit2policy flows.json --report-only
@@ -90,8 +94,16 @@ Query a Grafana Loki instance directly -- ideal when Hubble flows are already be
 # All flows from the last hour:
 hubble-audit2policy --from loki --loki-url http://loki:3100 --dry-run
 
-# Scoped to a namespace with a custom time window:
+# Scoped to a namespace with a relative time window:
 hubble-audit2policy --from loki --loki-url http://loki:3100 --since 2h --until 30m -n kube-system -o policies/
+
+# Absolute time range (ISO 8601 timestamps):
+hubble-audit2policy --from loki --loki-url http://loki:3100 \
+  --since 2026-03-27T20:00:00Z --until 2026-03-29T08:00:00Z -o policies/
+
+# Date-only shorthand (midnight UTC):
+hubble-audit2policy --from loki --loki-url http://loki:3100 \
+  --since 2026-03-27 --until 2026-03-29 -o policies/
 
 # Custom LogQL selector (adjust to match your labels):
 hubble-audit2policy --from loki --loki-url http://loki:3100 --loki-query '{namespace="hubble"}'
@@ -174,8 +186,8 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
                     [--hubble-cmd CMD] [--capture-file FILE]
                     [--no-enrich]
                     [--from {file,loki}] [--loki-url URL]
-                    [--loki-query LOGQL] [--since DURATION]
-                    [--until DURATION] [--loki-limit N]
+                    [--loki-query LOGQL] [--since TIME]
+                    [--until TIME] [--loki-limit N]
                     [--loki-user USER] [--loki-password PASSWORD]
                     [--loki-token TOKEN] [--loki-tls-ca PATH]
                     [-v] [-V]
@@ -201,8 +213,8 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `--from {file,loki}` | Flow source backend (default: `file`) |
 | `--loki-url URL` | Loki base URL, e.g. `http://loki:3100` |
 | `--loki-query LOGQL` | LogQL stream selector (default: `{app="hubble"}`) |
-| `--since DURATION` | How far back to query, e.g. `30m`, `2h`, `1d` (default: `1h`) |
-| `--until DURATION` | End of query window as duration before now (default: `0s` = now) |
+| `--since TIME` | Start of query window: relative duration (`30m`, `2h`, `1d`) or ISO 8601 timestamp (`2026-03-27T20:00:00`, `2026-03-27`) (default: `1h`) |
+| `--until TIME` | End of query window: relative duration or ISO 8601 timestamp (default: `0s` = now) |
 | `--loki-limit N` | Max entries per Loki request batch (default: `5000`) |
 | `--loki-user USER` | Username for Loki HTTP Basic authentication |
 | `--loki-password PASSWORD` | Password for Loki HTTP Basic authentication (used with `--loki-user`) |

@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.7.5"
+__version__ = "0.8.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -16,6 +16,7 @@ import argparse
 import base64
 import curses
 import dataclasses
+import datetime
 import io
 import json
 import logging
@@ -408,6 +409,53 @@ def _parse_duration(value: str) -> float:
     return num * multipliers[unit]
 
 
+def _parse_timestamp(value: str) -> datetime.datetime:
+    """Parse an ISO 8601 datetime string into a datetime object.
+
+    Accepted formats::
+
+        2026-03-27T20:00:00        (naive, treated as local time)
+        2026-03-27T20:00:00Z       (UTC)
+        2026-03-27T20:00:00+02:00  (explicit offset)
+        2026-03-27                 (date only, midnight local time)
+    """
+    text = value.strip()
+    # Date-only shorthand: treat as midnight local time.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        text += "T00:00:00"
+    # Python's fromisoformat doesn't accept trailing 'Z' before 3.11.
+    if text.endswith("Z") or text.endswith("z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid timestamp {value!r} "
+            "-- expected ISO 8601, e.g. 2026-03-27T20:00:00 or 2026-03-27"
+        ) from exc
+    return dt
+
+
+def _parse_time_arg(value: str) -> float:
+    """Parse a --since/--until argument into a Unix timestamp (seconds).
+
+    Accepts either a relative duration (``2h``, ``30m``) interpreted as
+    seconds before *now*, or an absolute ISO 8601 datetime.
+    """
+    text = value.strip()
+    # Try relative duration first (cheap regex check).
+    if re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd])?", text):
+        offset = _parse_duration(text)
+        return time.time() - offset
+    # Fall through to absolute timestamp.
+    dt = _parse_timestamp(text)
+    # Naive datetimes are treated as local time.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt = dt.astimezone(datetime.timezone.utc)
+    return dt.timestamp()
+
+
 def _build_loki_ssl_context(
     ca_cert: str | None = None,
 ) -> ssl.SSLContext | None:
@@ -428,8 +476,8 @@ def _build_loki_ssl_context(
 def _read_flows_loki(
     loki_url: str,
     query: str,
-    since_seconds: float,
-    until_seconds: float,
+    start_epoch: float,
+    end_epoch: float,
     limit: int = 5000,
     *,
     loki_user: str | None = None,
@@ -445,10 +493,10 @@ def _read_flows_loki(
         Base URL of the Loki instance, e.g. ``http://loki:3100``.
     query:
         LogQL stream selector, e.g. ``{app="hubble"}``.
-    since_seconds:
-        Start of the query window as seconds before *now*.
-    until_seconds:
-        End of the query window as seconds before *now* (0 = now).
+    start_epoch:
+        Start of the query window as a Unix timestamp in seconds.
+    end_epoch:
+        End of the query window as a Unix timestamp in seconds.
     limit:
         Maximum number of log entries per request batch.
     loki_user:
@@ -460,9 +508,8 @@ def _read_flows_loki(
     loki_tls_ca:
         Path to a PEM CA certificate for TLS verification.
     """
-    now = time.time()
-    start_ns = int((now - since_seconds) * 1_000_000_000)
-    end_ns = int((now - until_seconds) * 1_000_000_000)
+    start_ns = int(start_epoch * 1_000_000_000)
+    end_ns = int(end_epoch * 1_000_000_000)
 
     base = loki_url.rstrip("/")
     fetched = 0
@@ -1952,14 +1999,21 @@ Loki backend (query flows stored in Grafana Loki):
     loki_group.add_argument(
         "--since",
         default="1h",
-        metavar="DURATION",
-        help="How far back to query, e.g. 30m, 2h, 1d (default: 1h)",
+        metavar="TIME",
+        help=(
+            "Start of query window: relative duration (30m, 2h, 1d) "
+            "or ISO 8601 timestamp (2026-03-27T20:00:00, 2026-03-27) "
+            "(default: 1h)"
+        ),
     )
     loki_group.add_argument(
         "--until",
         default="0s",
-        metavar="DURATION",
-        help="End of query window as duration before now (default: 0s = now)",
+        metavar="TIME",
+        help=(
+            "End of query window: relative duration or ISO 8601 timestamp "
+            "(default: 0s = now)"
+        ),
     )
     loki_group.add_argument(
         "--loki-limit",
@@ -2030,13 +2084,13 @@ def main() -> None:
             parser.error("--loki-token and --loki-user are mutually exclusive")
         if args.loki_password and not args.loki_user:
             parser.error("--loki-password requires --loki-user")
-        since_sec = _parse_duration(args.since)
-        until_sec = _parse_duration(args.until)
+        start_epoch = _parse_time_arg(args.since)
+        end_epoch = _parse_time_arg(args.until)
         loki_iter = _read_flows_loki(
             args.loki_url,
             args.loki_query,
-            since_sec,
-            until_sec,
+            start_epoch,
+            end_epoch,
             args.loki_limit,
             loki_user=args.loki_user,
             loki_password=args.loki_password,

@@ -241,6 +241,74 @@ class TestParseDuration:
         assert h._parse_duration("1.5h") == 5400.0
 
 
+class TestParseTimestamp:
+    def test_full_iso(self) -> None:
+        import datetime
+
+        dt = h._parse_timestamp("2026-03-27T20:00:00")
+        assert dt == datetime.datetime(2026, 3, 27, 20, 0, 0)
+
+    def test_utc_z_suffix(self) -> None:
+        import datetime
+
+        dt = h._parse_timestamp("2026-03-27T20:00:00Z")
+        assert dt == datetime.datetime(
+            2026, 3, 27, 20, 0, 0, tzinfo=datetime.timezone.utc
+        )
+
+    def test_date_only(self) -> None:
+        import datetime
+
+        dt = h._parse_timestamp("2026-03-27")
+        assert dt == datetime.datetime(2026, 3, 27, 0, 0, 0)
+
+    def test_with_offset(self) -> None:
+        import datetime
+
+        dt = h._parse_timestamp("2026-03-27T20:00:00+02:00")
+        assert dt.utcoffset() == datetime.timedelta(hours=2)
+
+    def test_invalid_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            h._parse_timestamp("not-a-date")
+
+    def test_whitespace_tolerance(self) -> None:
+        import datetime
+
+        dt = h._parse_timestamp("  2026-03-27T10:00:00  ")
+        assert dt == datetime.datetime(2026, 3, 27, 10, 0, 0)
+
+
+class TestParseTimeArg:
+    def test_relative_duration(self) -> None:
+        import time
+
+        before = time.time() - 3600
+        result = h._parse_time_arg("1h")
+        after = time.time() - 3600
+        assert before <= result <= after
+
+    def test_absolute_timestamp(self) -> None:
+        result = h._parse_time_arg("2026-03-27T00:00:00Z")
+        # 2026-03-27 00:00:00 UTC
+        assert abs(result - 1774569600.0) < 1.0
+
+    def test_date_only(self) -> None:
+        result = h._parse_time_arg("2026-03-27")
+        # Should resolve to midnight UTC
+        assert abs(result - 1774569600.0) < 1.0
+
+    def test_zero_duration_means_now(self) -> None:
+        import time
+
+        before = time.time()
+        result = h._parse_time_arg("0s")
+        after = time.time()
+        assert before <= result <= after
+
+
 class TestParseFlowsWithIterator:
     """parse_flows accepts a flow_iter to decouple from file I/O."""
 
