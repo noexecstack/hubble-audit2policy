@@ -1647,8 +1647,7 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
                     _print_unknown_warnings(unknown_keys, flow_counts, file=buf)
 
                 buf.write(
-                    "\nj/k line  |  d/u half-page"
-                    "  |  g/G top/bottom  |  s select  |  q quit\n"
+                    "\nj/k line  |  d/u half-page  |  g/G top/bottom  |  s select  |  q quit\n"
                 )
                 content_lines = buf.getvalue().splitlines()
                 final_content = content_lines
