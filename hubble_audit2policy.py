@@ -521,7 +521,7 @@ def _read_flows_loki(
                 try:
                     yield fetched, json.loads(line)
                 except json.JSONDecodeError:
-                    pass  # Non-JSON lines (e.g. cilium agent log lines) are expected and silently skipped.
+                    pass  # Non-JSON lines (e.g. cilium agent logs) are expected.
 
         # If we got fewer entries than the limit, we've exhausted the range.
         if batch_count < limit:
