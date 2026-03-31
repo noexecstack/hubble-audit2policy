@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -430,12 +430,13 @@ def _read_flows_loki(
     query: str,
     since_seconds: float,
     until_seconds: float,
-    limit: int = 5000,
+    limit: int = 1000,
     *,
     loki_user: str | None = None,
     loki_password: str | None = None,
     loki_token: str | None = None,
     loki_tls_ca: str | None = None,
+    loki_org_id: str | None = None,
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield *(lineno, flow_dict)* by querying a Loki instance.
 
@@ -444,7 +445,7 @@ def _read_flows_loki(
     loki_url:
         Base URL of the Loki instance, e.g. ``http://loki:3100``.
     query:
-        LogQL stream selector, e.g. ``{app="hubble"}``.
+        LogQL stream selector, e.g. ``{container="cilium-agent"}``.
     since_seconds:
         Start of the query window as seconds before *now*.
     until_seconds:
@@ -474,6 +475,8 @@ def _read_flows_loki(
     elif loki_user:
         cred = base64.b64encode(f"{loki_user}:{loki_password or ''}".encode()).decode("ascii")
         headers["Authorization"] = f"Basic {cred}"
+    if loki_org_id:
+        headers["X-Scope-OrgID"] = loki_org_id
 
     ssl_ctx = _build_loki_ssl_context(loki_tls_ca)
 
@@ -492,7 +495,7 @@ def _read_flows_loki(
 
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+            with urllib.request.urlopen(req, timeout=120, context=ssl_ctx) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError) as exc:
             LOG.error("Failed to query Loki at %s: %s", loki_url, exc)
@@ -517,8 +520,8 @@ def _read_flows_loki(
                     continue
                 try:
                     yield fetched, json.loads(line)
-                except json.JSONDecodeError as exc:
-                    LOG.warning("Skipping malformed JSON from Loki (entry %d): %s", fetched, exc)
+                except json.JSONDecodeError:
+                    pass  # Non-JSON lines (e.g. cilium agent log lines) are expected and silently skipped.
 
         # If we got fewer entries than the limit, we've exhausted the range.
         if batch_count < limit:
@@ -675,6 +678,10 @@ def _parse_flow_list(
 
     for flow in flows:
         total += 1
+        # Unwrap the {"flow": {...}} envelope used by Hubble dynamic exports
+        # via the Cilium configmap (hubble.export.*).
+        if "flow" in flow and "source" not in flow:
+            flow = flow["flow"]
         if verdicts and flow.get("verdict", "").upper() not in verdicts:
             continue
         if _apply_flow(flow, label_keys, namespaces, policies, flow_counts, app_pods):
@@ -1551,6 +1558,7 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
         loki_password=args.loki_password,
         loki_token=args.loki_token,
         loki_tls_ca=args.loki_tls_ca,
+        loki_org_id=args.loki_org_id,
     ):
         loki_flows.append(flow)
 
@@ -2229,9 +2237,9 @@ Loki backend (query flows stored in Grafana Loki):
     )
     loki_group.add_argument(
         "--loki-query",
-        default='{app="hubble"}',
+        default='{container="cilium-agent"}',
         metavar="LOGQL",
-        help='LogQL stream selector (default: {app="hubble"})',
+        help='LogQL stream selector (default: {container="cilium-agent"})',
     )
     loki_group.add_argument(
         "--since",
@@ -2248,9 +2256,9 @@ Loki backend (query flows stored in Grafana Loki):
     loki_group.add_argument(
         "--loki-limit",
         type=int,
-        default=5000,
+        default=1000,
         metavar="N",
-        help="Max entries per Loki request batch (default: 5000)",
+        help="Max entries per Loki request batch (default: 1000)",
     )
     loki_group.add_argument(
         "--loki-user",
@@ -2271,6 +2279,11 @@ Loki backend (query flows stored in Grafana Loki):
         "--loki-tls-ca",
         metavar="PATH",
         help="Path to a PEM CA certificate for verifying the Loki server (self-signed certs)",
+    )
+    loki_group.add_argument(
+        "--loki-org-id",
+        metavar="ORG_ID",
+        help="Tenant ID sent as X-Scope-OrgID header (required when Loki auth_enabled=true)",
     )
 
     parser.add_argument(
@@ -2329,6 +2342,7 @@ def main() -> None:
             loki_password=args.loki_password,
             loki_token=args.loki_token,
             loki_tls_ca=args.loki_tls_ca,
+            loki_org_id=args.loki_org_id,
         )
         print(
             f"Querying Loki at {args.loki_url} "
