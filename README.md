@@ -86,10 +86,12 @@ hubble-audit2policy flows.json --report-only
 
 ## Loki Backend
 
-Query a Grafana Loki instance directly -- ideal when Hubble flows are already being shipped to Loki via fluentd or another collector:
+Query a Grafana Loki instance directly -- ideal when Hubble flows are already being shipped to Loki via fluentd, promtail, or another collector.
+
+The default LogQL selector is `{container="cilium-agent"}`, which matches the standard Cilium agent container label. Override it with `--loki-query` if your setup uses different labels.
 
 ```bash
-# All flows from the last hour:
+# All flows from the last hour (uses default query {container="cilium-agent"}):
 hubble-audit2policy --from loki --loki-url http://loki:3100 --dry-run
 
 # Scoped to a namespace with a custom time window:
@@ -97,13 +99,37 @@ hubble-audit2policy --from loki --loki-url http://loki:3100 --since 2h --until 3
 
 # Custom LogQL selector (adjust to match your labels):
 hubble-audit2policy --from loki --loki-url http://loki:3100 --loki-query '{namespace="hubble"}'
+
+# Interactive TUI for browsing and selecting Loki flows:
+hubble-audit2policy --from loki --loki-url http://loki:3100 --watch
+```
+
+### Loki authentication
+
+```bash
+# Bearer token (e.g. Grafana Cloud):
+hubble-audit2policy --from loki --loki-url https://loki.example.com --loki-token "$LOKI_TOKEN"
+
+# HTTP Basic auth:
+hubble-audit2policy --from loki --loki-url https://loki.example.com --loki-user admin --loki-password secret
+
+# Multi-tenant Loki (auth_enabled=true) -- sends the X-Scope-OrgID header:
+hubble-audit2policy --from loki --loki-url http://loki:3100 --loki-org-id my-tenant
+
+# Self-signed TLS certificate:
+hubble-audit2policy --from loki --loki-url https://loki.internal:3100 --loki-tls-ca /path/to/ca.pem
 ```
 
 All existing filters (`-n`, `--verdict`, `--label-key`, `--report`, etc.) work identically with the Loki backend.
 
 ## Live Watch Mode
 
-Watch mode spawns `hubble observe` internally and continuously refreshes a flow-frequency report in a curses-based TUI. No separate terminal or manual capture needed -- just run:
+Watch mode presents an interactive curses-based TUI with a continuously refreshed flow-frequency report. It works with both live Hubble streams and historical Loki data:
+
+- **Live** (default): spawns `hubble observe` internally, no separate terminal needed.
+- **Loki** (`--from loki --watch`): fetches historical flows from Loki and presents them in the same TUI for browsing and selection.
+
+For live mode, just run:
 
 ```bash
 hubble-audit2policy --watch
@@ -154,6 +180,15 @@ hubble-audit2policy --watch --dry-run   # preview selected policies on stdout
 | `Enter` | Generate policies from selected flows and quit |
 | `Esc` | Exit select mode and clear selections |
 | `q / Ctrl-C` | Quit (last report is printed to the terminal) |
+
+## Supported Flow Formats
+
+The tool accepts Hubble flows in two formats:
+
+- **Flat flow objects** -- the standard JSONL output from `hubble observe -o json`, where each line is a flow dict with `source`, `destination`, `l4`, etc. at the top level.
+- **Envelope format** (`{"flow": {...}}`) -- used by Hubble dynamic exports configured via the Cilium configmap (`hubble.export.*`). The envelope is automatically unwrapped.
+
+Both formats work with all backends (file, Loki, live watch).
 
 ## Cluster Enrichment
 
