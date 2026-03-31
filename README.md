@@ -25,12 +25,14 @@ It also works with live Hubble streams and plain JSON files if that is what you 
 ## Installation
 
 ```bash
-pip install hubble-audit2policy
+pip install git+https://github.com/noexecstack/hubble-audit2policy.git
 ```
 
 For development (includes pytest, ruff, mypy):
 
 ```bash
+git clone https://github.com/noexecstack/hubble-audit2policy.git
+cd hubble-audit2policy
 pip install -e ".[dev]"
 ```
 
@@ -178,6 +180,7 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
                     [--until DURATION] [--loki-limit N]
                     [--loki-user USER] [--loki-password PASSWORD]
                     [--loki-token TOKEN] [--loki-tls-ca PATH]
+                    [--loki-org-id ORG_ID]
                     [-v] [-V]
                     [flows_file]
 ```
@@ -200,14 +203,15 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `--no-enrich` | Skip live cluster enrichment via Cilium endpoints |
 | `--from {file,loki}` | Flow source backend (default: `file`) |
 | `--loki-url URL` | Loki base URL, e.g. `http://loki:3100` |
-| `--loki-query LOGQL` | LogQL stream selector (default: `{app="hubble"}`) |
+| `--loki-query LOGQL` | LogQL stream selector (default: `{container="cilium-agent"}`) |
 | `--since DURATION` | How far back to query, e.g. `30m`, `2h`, `1d` (default: `1h`) |
 | `--until DURATION` | End of query window as duration before now (default: `0s` = now) |
-| `--loki-limit N` | Max entries per Loki request batch (default: `5000`) |
+| `--loki-limit N` | Max entries per Loki request batch (default: `1000`) |
 | `--loki-user USER` | Username for Loki HTTP Basic authentication |
 | `--loki-password PASSWORD` | Password for Loki HTTP Basic authentication (used with `--loki-user`) |
 | `--loki-token TOKEN` | Bearer token for Loki (`Authorization: Bearer ...`) header |
 | `--loki-tls-ca PATH` | Path to a PEM CA certificate for verifying the Loki server (self-signed certs) |
+| `--loki-org-id ORG_ID` | Tenant ID sent as `X-Scope-OrgID` header (required when Loki `auth_enabled=true`) |
 | `-v, --verbose` | Enable verbose logging |
 | `-V, --version` | Show version and exit |
 
