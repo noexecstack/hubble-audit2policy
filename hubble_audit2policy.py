@@ -8,12 +8,13 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
 import argparse
 import base64
+import concurrent.futures
 import curses
 import dataclasses
 import io
@@ -425,20 +426,94 @@ def _build_loki_ssl_context(
     return ctx
 
 
+def _loki_fetch_chunk(
+    base_url: str,
+    query: str,
+    start_ns: int,
+    end_ns: int,
+    limit: int,
+    headers: dict[str, str],
+    ssl_ctx: ssl.SSLContext | None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Fetch log entries from Loki for a single time segment.
+
+    Returns a list of *(timestamp_ns, flow_dict)* tuples.  Handles
+    cursor-based pagination internally so the caller receives all
+    entries in the ``[start_ns, end_ns)`` window.
+    """
+    entries: list[tuple[int, dict[str, Any]]] = []
+    while True:
+        params = urllib.parse.urlencode(
+            {
+                "query": query,
+                "start": str(start_ns),
+                "end": str(end_ns),
+                "limit": str(limit),
+                "direction": "FORWARD",
+            }
+        )
+        url = f"{base_url}/loki/api/v1/query_range?{params}"
+        LOG.debug("Loki request: %s", url)
+
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120, context=ssl_ctx) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError) as exc:
+            LOG.error("Failed to query Loki: %s", exc)
+            return entries
+
+        status = body.get("status")
+        if status != "success":
+            LOG.error("Loki query failed (status=%s): %s", status, body)
+            return entries
+
+        streams = body.get("data", {}).get("result", [])
+        batch_count = 0
+        last_ts: int | None = None
+
+        for stream in streams:
+            for ts_str, line in stream.get("values", []):
+                batch_count += 1
+                last_ts = int(ts_str)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append((last_ts, json.loads(line)))
+                except json.JSONDecodeError:
+                    pass  # Non-JSON lines (e.g. cilium agent logs) are expected.
+
+        if batch_count < limit:
+            break
+
+        if last_ts is not None:
+            start_ns = last_ts + 1
+        else:
+            break
+
+    return entries
+
+
 def _read_flows_loki(
     loki_url: str,
     query: str,
     since_seconds: float,
     until_seconds: float,
-    limit: int = 1000,
+    limit: int = 5000,
     *,
     loki_user: str | None = None,
     loki_password: str | None = None,
     loki_token: str | None = None,
     loki_tls_ca: str | None = None,
     loki_org_id: str | None = None,
+    threads: int = 4,
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield *(lineno, flow_dict)* by querying a Loki instance.
+
+    The query time range is split into *threads* equal segments and
+    fetched in parallel using a thread pool, then merged in timestamp
+    order with monotonically increasing line numbers.
 
     Parameters
     ----------
@@ -460,13 +535,14 @@ def _read_flows_loki(
         Bearer token for ``Authorization: Bearer ...`` header.
     loki_tls_ca:
         Path to a PEM CA certificate for TLS verification.
+    threads:
+        Number of parallel time segments (default: 4).
     """
     now = time.time()
     start_ns = int((now - since_seconds) * 1_000_000_000)
     end_ns = int((now - until_seconds) * 1_000_000_000)
 
     base = loki_url.rstrip("/")
-    fetched = 0
 
     # Build auth header (if any).
     headers: dict[str, str] = {"Accept": "application/json"}
@@ -480,60 +556,35 @@ def _read_flows_loki(
 
     ssl_ctx = _build_loki_ssl_context(loki_tls_ca)
 
-    while True:
-        params = urllib.parse.urlencode(
-            {
-                "query": query,
-                "start": str(start_ns),
-                "end": str(end_ns),
-                "limit": str(limit),
-                "direction": "FORWARD",
-            }
-        )
-        url = f"{base}/loki/api/v1/query_range?{params}"
-        LOG.debug("Loki request: %s", url)
+    # Determine how many parallel segments to use.  Avoid creating more
+    # segments than there are seconds in the range.
+    span = end_ns - start_ns
+    num_segments = max(1, min(threads, span // 1_000_000_000))
 
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=120, context=ssl_ctx) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, OSError) as exc:
-            LOG.error("Failed to query Loki at %s: %s", loki_url, exc)
-            return
+    if num_segments <= 1:
+        # Fast path: single segment, no thread pool overhead.
+        entries = _loki_fetch_chunk(base, query, start_ns, end_ns, limit, headers, ssl_ctx)
+    else:
+        boundaries = [start_ns + span * i // num_segments for i in range(num_segments)]
+        boundaries.append(end_ns)
+        segments = [(boundaries[i], boundaries[i + 1]) for i in range(num_segments)]
 
-        status = body.get("status")
-        if status != "success":
-            LOG.error("Loki query failed (status=%s): %s", status, body)
-            return
+        all_entries: list[tuple[int, dict[str, Any]]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_segments) as pool:
+            futures = [
+                pool.submit(_loki_fetch_chunk, base, query, s, e, limit, headers, ssl_ctx)
+                for s, e in segments
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                all_entries.extend(future.result())
 
-        streams = body.get("data", {}).get("result", [])
-        batch_count = 0
-        last_ts: int | None = None
+        entries = all_entries
 
-        for stream in streams:
-            for ts_str, line in stream.get("values", []):
-                fetched += 1
-                batch_count += 1
-                last_ts = int(ts_str)
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield fetched, json.loads(line)
-                except json.JSONDecodeError:
-                    pass  # Non-JSON lines (e.g. cilium agent logs) are expected.
+    entries.sort(key=lambda x: x[0])
+    LOG.debug("Fetched %d log entries from Loki", len(entries))
 
-        # If we got fewer entries than the limit, we've exhausted the range.
-        if batch_count < limit:
-            break
-
-        # Otherwise paginate forward: start just after the last timestamp.
-        if last_ts is not None:
-            start_ns = last_ts + 1
-        else:
-            break
-
-    LOG.debug("Fetched %d log entries from Loki", fetched)
+    for lineno, (_, flow) in enumerate(entries, 1):
+        yield lineno, flow
 
 
 def parse_flows(
@@ -1559,6 +1610,7 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
         loki_token=args.loki_token,
         loki_tls_ca=args.loki_tls_ca,
         loki_org_id=args.loki_org_id,
+        threads=args.loki_threads,
     ):
         loki_flows.append(flow)
 
@@ -2256,9 +2308,9 @@ Loki backend (query flows stored in Grafana Loki):
     loki_group.add_argument(
         "--loki-limit",
         type=int,
-        default=1000,
+        default=5000,
         metavar="N",
-        help="Max entries per Loki request batch (default: 1000)",
+        help="Max entries per Loki request batch (default: 5000)",
     )
     loki_group.add_argument(
         "--loki-user",
@@ -2284,6 +2336,13 @@ Loki backend (query flows stored in Grafana Loki):
         "--loki-org-id",
         metavar="ORG_ID",
         help="Tenant ID sent as X-Scope-OrgID header (required when Loki auth_enabled=true)",
+    )
+    loki_group.add_argument(
+        "--loki-threads",
+        type=int,
+        default=4,
+        metavar="N",
+        help="Number of parallel time segments for Loki queries (default: 4)",
     )
 
     parser.add_argument(
@@ -2343,6 +2402,7 @@ def main() -> None:
             loki_token=args.loki_token,
             loki_tls_ca=args.loki_tls_ca,
             loki_org_id=args.loki_org_id,
+            threads=args.loki_threads,
         )
         print(
             f"Querying Loki at {args.loki_url} "

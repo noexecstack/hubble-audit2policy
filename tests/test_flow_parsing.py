@@ -290,7 +290,9 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
+            )
             assert len(result) == 2
             assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
             assert result[1][1]["l4"]["TCP"]["destination_port"] == 443
@@ -305,13 +307,17 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
+            )
             assert len(result) == 0
 
     def test_connection_error(self) -> None:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.side_effect = OSError("connection refused")
-            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
+            )
             assert len(result) == 0
 
     def test_malformed_json_skipped(self) -> None:
@@ -334,7 +340,9 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
+            )
             assert len(result) == 2
 
     def test_pagination(self) -> None:
@@ -392,7 +400,9 @@ class TestReadFlowsLoki:
             mock_open.side_effect = responses
             # limit=1 forces pagination after each entry.
             result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, limit=1)
+                h._read_flows_loki(
+                    "http://loki:3100", '{app="hubble"}', 3600, 0, limit=1, threads=1
+                )
             )
             assert len(result) == 2
             assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
@@ -431,7 +441,9 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
+            )
             assert len(result) == 2
 
     def test_query_params_forwarded(self) -> None:
@@ -450,7 +462,11 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            list(h._read_flows_loki("http://loki:3100", '{namespace="hubble"}', 7200, 0, limit=100))
+            list(
+                h._read_flows_loki(
+                    "http://loki:3100", '{namespace="hubble"}', 7200, 0, limit=100, threads=1
+                )
+            )
             req = mock_open.call_args[0][0]
             url = req.full_url
             assert "/loki/api/v1/query_range?" in url
@@ -483,8 +499,54 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
+            )
             assert len(result) == 1
+
+    def test_parallel_merges_segments(self) -> None:
+        """Multiple threads fetch different time segments; results merge in timestamp order."""
+        flow_a = _make_flow(port=80)
+        flow_b = _make_flow(port=443)
+
+        def _fake_urlopen(req, **kwargs):  # noqa: ARG001
+            url = req.full_url
+            # Parse start param to determine which segment this is.
+            params = dict(p.split("=") for p in url.split("?")[1].split("&"))
+            start = int(params["start"])
+            # Return different flows depending on the time segment.
+            if start < mid_ns:
+                values = [["1000000000", json.dumps(flow_a)]]
+            else:
+                values = [["2000000000", json.dumps(flow_b)]]
+            body = {
+                "status": "success",
+                "data": {"result": [{"stream": {}, "values": values}]},
+            }
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = mock.Mock(return_value=resp)
+            resp.__exit__ = mock.Mock(return_value=False)
+            return resp
+
+        import time
+
+        now = time.time()
+        start_ns = int((now - 3600) * 1_000_000_000)
+        end_ns = int(now * 1_000_000_000)
+        mid_ns = (start_ns + end_ns) // 2
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen", side_effect=_fake_urlopen):
+            result = list(
+                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=2)
+            )
+            assert len(result) == 2
+            # Results should be ordered by timestamp (port 80 first, then 443).
+            assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
+            assert result[1][1]["l4"]["TCP"]["destination_port"] == 443
+            # Line numbers should be monotonically increasing.
+            assert result[0][0] == 1
+            assert result[1][0] == 2
 
 
 class TestLokiEndToEnd:
@@ -510,7 +572,9 @@ class TestLokiEndToEnd:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            loki_iter = h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0)
+            loki_iter = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0, threads=1
+            )
             policies, _, total, matched, _ = h.parse_flows(
                 "", LABEL_KEYS, set(), set(), flow_iter=loki_iter
             )
@@ -547,6 +611,7 @@ class TestLokiAuth:
                     3600,
                     0,
                     loki_token="my-secret-token",
+                    threads=1,
                 )
             )
             req = mock_open.call_args[0][0]
@@ -563,6 +628,7 @@ class TestLokiAuth:
                     0,
                     loki_user="admin",
                     loki_password="s3cret",
+                    threads=1,
                 )
             )
             req = mock_open.call_args[0][0]
@@ -579,6 +645,7 @@ class TestLokiAuth:
                     3600,
                     0,
                     loki_user="admin",
+                    threads=1,
                 )
             )
             req = mock_open.call_args[0][0]
@@ -588,7 +655,7 @@ class TestLokiAuth:
     def test_no_auth_header_by_default(self) -> None:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.return_value = self._mock_urlopen()
-            list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0))
+            list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1))
             req = mock_open.call_args[0][0]
             assert req.get_header("Authorization") is None
 
@@ -605,6 +672,7 @@ class TestLokiAuth:
                     3600,
                     0,
                     loki_tls_ca="/path/to/ca.pem",
+                    threads=1,
                 )
             )
             mock_ctx.assert_called_once_with(cafile="/path/to/ca.pem")
@@ -627,6 +695,7 @@ class TestLokiAuth:
                     0,
                     loki_token="tok",
                     loki_tls_ca="/path/to/ca.pem",
+                    threads=1,
                 )
             )
             req = mock_open.call_args[0][0]
