@@ -215,7 +215,8 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
                     [--until DURATION] [--loki-limit N]
                     [--loki-user USER] [--loki-password PASSWORD]
                     [--loki-token TOKEN] [--loki-tls-ca PATH]
-                    [--loki-org-id ORG_ID]
+                    [--loki-org-id ORG_ID] [--loki-threads N]
+                    [--loki-chunk DURATION] [--loki-timeout SECONDS]
                     [-v] [-V]
                     [flows_file]
 ```
@@ -241,12 +242,15 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `--loki-query LOGQL` | LogQL stream selector (default: `{container="cilium-agent"}`) |
 | `--since DURATION` | How far back to query, e.g. `30m`, `2h`, `1d` (default: `1h`) |
 | `--until DURATION` | End of query window as duration before now (default: `0s` = now) |
-| `--loki-limit N` | Max entries per Loki request batch (default: `1000`) |
+| `--loki-limit N` | Max entries per Loki request batch (default: `5000`) |
 | `--loki-user USER` | Username for Loki HTTP Basic authentication |
 | `--loki-password PASSWORD` | Password for Loki HTTP Basic authentication (used with `--loki-user`) |
 | `--loki-token TOKEN` | Bearer token for Loki (`Authorization: Bearer ...`) header |
 | `--loki-tls-ca PATH` | Path to a PEM CA certificate for verifying the Loki server (self-signed certs) |
 | `--loki-org-id ORG_ID` | Tenant ID sent as `X-Scope-OrgID` header (required when Loki `auth_enabled=true`) |
+| `--loki-threads N` | Number of parallel worker threads for Loki queries (default: `8`) |
+| `--loki-chunk DURATION` | Max time window per Loki request, e.g. `5s`, `30s`, `1m` (default: `5m` with `-n`, `5s` otherwise) |
+| `--loki-timeout SECONDS` | HTTP request timeout in seconds for each Loki request (default: `30`) |
 | `-v, --verbose` | Enable verbose logging |
 | `-V, --version` | Show version and exit |
 

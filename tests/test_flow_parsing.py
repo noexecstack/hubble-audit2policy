@@ -290,9 +290,10 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            ).flows
             assert len(result) == 2
             assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
             assert result[1][1]["l4"]["TCP"]["destination_port"] == 443
@@ -307,17 +308,19 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            ).flows
             assert len(result) == 0
 
     def test_connection_error(self) -> None:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.side_effect = OSError("connection refused")
-            result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            ).flows
             assert len(result) == 0
 
     def test_malformed_json_skipped(self) -> None:
@@ -340,9 +343,10 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            ).flows
             assert len(result) == 2
 
     def test_pagination(self) -> None:
@@ -399,11 +403,10 @@ class TestReadFlowsLoki:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.side_effect = responses
             # limit=1 forces pagination after each entry.
-            result = list(
-                h._read_flows_loki(
-                    "http://loki:3100", '{app="hubble"}', 3600, 0, limit=1, threads=1
-                )
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0, limit=1,
+                threads=1, chunk_seconds=7200,
+            ).flows
             assert len(result) == 2
             assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
             assert result[1][1]["l4"]["TCP"]["destination_port"] == 443
@@ -441,9 +444,10 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            ).flows
             assert len(result) == 2
 
     def test_query_params_forwarded(self) -> None:
@@ -462,10 +466,9 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            list(
-                h._read_flows_loki(
-                    "http://loki:3100", '{namespace="hubble"}', 7200, 0, limit=100, threads=1
-                )
+            h._read_flows_loki(
+                "http://loki:3100", '{namespace="hubble"}', 7200, 0, limit=100,
+                threads=1, chunk_seconds=14400,
             )
             req = mock_open.call_args[0][0]
             url = req.full_url
@@ -499,9 +502,10 @@ class TestReadFlowsLoki:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            ).flows
             assert len(result) == 1
 
     def test_parallel_merges_segments(self) -> None:
@@ -537,9 +541,10 @@ class TestReadFlowsLoki:
         mid_ns = (start_ns + end_ns) // 2
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen", side_effect=_fake_urlopen):
-            result = list(
-                h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=2)
-            )
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=2, chunk_seconds=1800,
+            ).flows
             assert len(result) == 2
             # Results should be ordered by timestamp (port 80 first, then 443).
             assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
@@ -547,6 +552,37 @@ class TestReadFlowsLoki:
             # Line numbers should be monotonically increasing.
             assert result[0][0] == 1
             assert result[1][0] == 2
+
+    def test_chunk_seconds_splits_into_many_requests(self) -> None:
+        """Small chunk_seconds creates more Loki requests than threads."""
+        flow = _make_flow(port=80)
+
+        def _fake_urlopen(req, **kwargs):  # noqa: ARG001
+            body = {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {"stream": {}, "values": [["1000000000", json.dumps(flow)]]}
+                    ]
+                },
+            }
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps(body).encode()
+            resp.__enter__ = mock.Mock(return_value=resp)
+            resp.__exit__ = mock.Mock(return_value=False)
+            return resp
+
+        with mock.patch(
+            "hubble_audit2policy.urllib.request.urlopen", side_effect=_fake_urlopen
+        ) as mock_open:
+            # 1h range with 600s chunks = 6 chunks, but only 2 worker threads.
+            result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=2, chunk_seconds=600,
+            ).flows
+            # 6 chunks, each returning 1 flow.
+            assert len(result) == 6
+            assert mock_open.call_count == 6
 
 
 class TestLokiEndToEnd:
@@ -572,9 +608,12 @@ class TestLokiEndToEnd:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            loki_iter = h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
+            loki_result = h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            )
             policies, _, total, matched, _ = h.parse_flows(
-                "", LABEL_KEYS, set(), set(), flow_iter=loki_iter
+                "", LABEL_KEYS, set(), set(), flow_iter=iter(loki_result.flows)
             )
             assert total == 2
             assert matched == 2
@@ -602,15 +641,13 @@ class TestLokiAuth:
     def test_bearer_token(self) -> None:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.return_value = self._mock_urlopen()
-            list(
-                h._read_flows_loki(
-                    "http://loki:3100",
-                    '{app="hubble"}',
-                    3600,
-                    0,
-                    loki_token="my-secret-token",
-                    threads=1,
-                )
+            h._read_flows_loki(
+                "http://loki:3100",
+                '{app="hubble"}',
+                3600,
+                0,
+                loki_token="my-secret-token",
+                threads=1, chunk_seconds=7200,
             )
             req = mock_open.call_args[0][0]
             assert req.get_header("Authorization") == "Bearer my-secret-token"
@@ -618,16 +655,14 @@ class TestLokiAuth:
     def test_basic_auth(self) -> None:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.return_value = self._mock_urlopen()
-            list(
-                h._read_flows_loki(
-                    "http://loki:3100",
-                    '{app="hubble"}',
-                    3600,
-                    0,
-                    loki_user="admin",
-                    loki_password="s3cret",
-                    threads=1,
-                )
+            h._read_flows_loki(
+                "http://loki:3100",
+                '{app="hubble"}',
+                3600,
+                0,
+                loki_user="admin",
+                loki_password="s3cret",
+                threads=1, chunk_seconds=7200,
             )
             req = mock_open.call_args[0][0]
             expected = "Basic " + base64.b64encode(b"admin:s3cret").decode("ascii")
@@ -636,15 +671,13 @@ class TestLokiAuth:
     def test_basic_auth_no_password(self) -> None:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.return_value = self._mock_urlopen()
-            list(
-                h._read_flows_loki(
-                    "http://loki:3100",
-                    '{app="hubble"}',
-                    3600,
-                    0,
-                    loki_user="admin",
-                    threads=1,
-                )
+            h._read_flows_loki(
+                "http://loki:3100",
+                '{app="hubble"}',
+                3600,
+                0,
+                loki_user="admin",
+                threads=1, chunk_seconds=7200,
             )
             req = mock_open.call_args[0][0]
             expected = "Basic " + base64.b64encode(b"admin:").decode("ascii")
@@ -653,7 +686,10 @@ class TestLokiAuth:
     def test_no_auth_header_by_default(self) -> None:
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
             mock_open.return_value = self._mock_urlopen()
-            list(h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1))
+            h._read_flows_loki(
+                "http://loki:3100", '{app="hubble"}', 3600, 0,
+                threads=1, chunk_seconds=7200,
+            )
             req = mock_open.call_args[0][0]
             assert req.get_header("Authorization") is None
 
@@ -663,15 +699,13 @@ class TestLokiAuth:
             mock.patch("hubble_audit2policy.ssl.create_default_context") as mock_ctx,
         ):
             mock_open.return_value = self._mock_urlopen()
-            list(
-                h._read_flows_loki(
-                    "https://loki:3100",
-                    '{app="hubble"}',
-                    3600,
-                    0,
-                    loki_tls_ca="/path/to/ca.pem",
-                    threads=1,
-                )
+            h._read_flows_loki(
+                "https://loki:3100",
+                '{app="hubble"}',
+                3600,
+                0,
+                loki_tls_ca="/path/to/ca.pem",
+                threads=1, chunk_seconds=7200,
             )
             mock_ctx.assert_called_once_with(cafile="/path/to/ca.pem")
             # The context should be passed to urlopen.
@@ -685,20 +719,38 @@ class TestLokiAuth:
             mock.patch("hubble_audit2policy.ssl.create_default_context") as mock_ctx,
         ):
             mock_open.return_value = self._mock_urlopen()
-            list(
-                h._read_flows_loki(
-                    "https://loki:3100",
-                    '{app="hubble"}',
-                    3600,
-                    0,
-                    loki_token="tok",
-                    loki_tls_ca="/path/to/ca.pem",
-                    threads=1,
-                )
+            h._read_flows_loki(
+                "https://loki:3100",
+                '{app="hubble"}',
+                3600,
+                0,
+                loki_token="tok",
+                loki_tls_ca="/path/to/ca.pem",
+                threads=1, chunk_seconds=7200,
             )
             req = mock_open.call_args[0][0]
             assert req.get_header("Authorization") == "Bearer tok"
             mock_ctx.assert_called_once_with(cafile="/path/to/ca.pem")
+
+    def test_enrich_query_no_namespaces(self) -> None:
+        q = '{container="cilium-agent"}'
+        assert h._loki_enrich_query(q, []) == q
+        assert h._loki_enrich_query(q, set()) == q
+
+    def test_enrich_query_single_namespace(self) -> None:
+        q = '{container="cilium-agent"}'
+        result = h._loki_enrich_query(q, ["argocd"])
+        assert result == r'{container="cilium-agent"} |= "\"namespace\":\"argocd\""'
+
+    def test_enrich_query_multiple_namespaces(self) -> None:
+        q = '{container="cilium-agent"}'
+        result = h._loki_enrich_query(q, ["monitoring", "argocd"])
+        assert result == r'{container="cilium-agent"} |~ "\"namespace\":\"(argocd|monitoring)\""'
+
+    def test_enrich_query_deduplicates(self) -> None:
+        q = '{container="cilium-agent"}'
+        result = h._loki_enrich_query(q, ["argocd", "argocd"])
+        assert result == r'{container="cilium-agent"} |= "\"namespace\":\"argocd\""'
 
     def test_build_loki_ssl_context_none(self) -> None:
         assert h._build_loki_ssl_context(None) is None
