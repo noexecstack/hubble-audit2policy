@@ -572,9 +572,7 @@ class TestLokiEndToEnd:
             mock_resp.__exit__ = mock.Mock(return_value=False)
             mock_open.return_value = mock_resp
 
-            loki_iter = h._read_flows_loki(
-                "http://loki:3100", '{app="hubble"}', 3600, 0, threads=1
-            )
+            loki_iter = h._read_flows_loki("http://loki:3100", '{app="hubble"}', 3600, 0, threads=1)
             policies, _, total, matched, _ = h.parse_flows(
                 "", LABEL_KEYS, set(), set(), flow_iter=loki_iter
             )
