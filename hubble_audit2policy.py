@@ -59,6 +59,7 @@ ParseResult = tuple[
     AppPods,
 ]
 
+
 # Result from _read_flows_loki().
 class LokiResult:
     __slots__ = ("flows", "partial")
@@ -625,9 +626,7 @@ def _read_flows_loki(
         done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
             futures = [
-                pool.submit(
-                    _loki_fetch_chunk, base, query, s, e, limit, headers, ssl_ctx, timeout
-                )
+                pool.submit(_loki_fetch_chunk, base, query, s, e, limit, headers, ssl_ctx, timeout)
                 for s, e in segments
             ]
             try:
