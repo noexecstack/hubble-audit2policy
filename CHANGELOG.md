@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-04-02
+
+### Added
+
+- Retry with exponential backoff for Loki chunk fetches: transient errors (timeouts, connection resets) are retried up to 3 times (1s, 2s, 4s delays) before giving up on a chunk.
+- New `--loki-retries N` CLI flag to control the number of retries per chunk (default: 3, set to 0 to disable).
+- Server-side verdict filter (`|= "\"verdict\":"`) is now always appended to Loki queries, reducing data transfer by filtering out non-flow cilium-agent log lines at the Loki level.
+- Summary warning printed after Loki fetch when retries or chunk failures occurred, with hints to adjust `--loki-timeout` or `--loki-chunk`.
+- Partial results from Loki are now flagged via `LokiResult.partial` when any chunk failed after exhausting retries.
+
 ## [0.7.6] - 2026-03-28
 
 ### Changed

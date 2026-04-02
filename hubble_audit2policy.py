@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -439,14 +439,22 @@ def _build_loki_ssl_context(
 def _loki_enrich_query(query: str, namespaces: Iterable[str]) -> str:
     r"""Append LogQL line filters for *namespaces* to *query*.
 
-    When the user passes ``-n argocd``, we inject a filter that matches
-    the JSON field pattern ``"namespace":"argocd"`` so Loki filters lines
-    server-side.  This avoids false positives from pod names or labels
-    that happen to contain the namespace string.
+    Always adds a ``"verdict":`` filter so only actual Hubble flow records
+    are returned (cilium-agent emits many other JSON log lines that would
+    otherwise bloat results and can exceed Loki gRPC size limits).
+
+    When the user passes ``-n argocd``, we additionally inject a filter
+    that matches the JSON field pattern ``"namespace":"argocd"`` so Loki
+    filters lines server-side.
 
     Multiple namespaces are OR-joined into a single regex filter, e.g.
     ``"namespace":"(argocd|monitoring)"``.
     """
+    # Every Hubble flow record contains "verdict": -- filter non-flow
+    # log lines server-side to avoid downloading megabytes of irrelevant
+    # cilium-agent logs.
+    query += r' |= "\"verdict\":"'
+
     ns_list = sorted(set(namespaces))
     if not ns_list:
         return query
@@ -454,6 +462,14 @@ def _loki_enrich_query(query: str, namespaces: Iterable[str]) -> str:
         return query + r' |= "\"namespace\":\"' + ns_list[0] + r'\""'
     pattern = "|".join(re.escape(ns) for ns in ns_list)
     return query + r' |~ "\"namespace\":\"(' + pattern + r')\""'
+
+
+@dataclasses.dataclass
+class _ChunkStats:
+    """Retry/error statistics for a single chunk fetch."""
+
+    retries: int = 0
+    failed: bool = False
 
 
 def _loki_fetch_chunk(
@@ -465,14 +481,20 @@ def _loki_fetch_chunk(
     headers: dict[str, str],
     ssl_ctx: ssl.SSLContext | None,
     timeout: int = 30,
-) -> list[tuple[int, dict[str, Any]]]:
+    retries: int = 3,
+) -> tuple[list[tuple[int, dict[str, Any]]], _ChunkStats]:
     """Fetch log entries from Loki for a single time segment.
 
-    Returns a list of *(timestamp_ns, flow_dict)* tuples.  Handles
-    cursor-based pagination internally so the caller receives all
-    entries in the ``[start_ns, end_ns)`` window.
+    Returns a tuple of *(entries, stats)* where *entries* is a list of
+    *(timestamp_ns, flow_dict)* tuples and *stats* tracks retry/error
+    counts.  Handles cursor-based pagination internally so the caller
+    receives all entries in the ``[start_ns, end_ns)`` window.
+
+    Transient errors (timeouts, connection resets) are retried up to
+    *retries* times with exponential backoff (1s, 2s, 4s, ...).
     """
     entries: list[tuple[int, dict[str, Any]]] = []
+    stats = _ChunkStats()
     while True:
         params = urllib.parse.urlencode(
             {
@@ -487,17 +509,37 @@ def _loki_fetch_chunk(
         LOG.debug("Loki request: %s", url)
 
         req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, OSError) as exc:
-            LOG.error("Failed to query Loki: %s", exc)
-            return entries
+        body: dict[str, Any] | None = None
+        for attempt in range(1 + retries):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                break
+            except (urllib.error.URLError, OSError) as exc:
+                if attempt < retries:
+                    delay = 2**attempt
+                    stats.retries += 1
+                    LOG.debug(
+                        "Loki request failed (%s), retrying in %ds (%d/%d) ...",
+                        exc,
+                        delay,
+                        attempt + 1,
+                        retries,
+                    )
+                    time.sleep(delay)
+                else:
+                    stats.failed = True
+                    LOG.debug("Failed to query Loki after %d retries: %s", retries, exc)
+                    return entries, stats
+
+        if body is None:
+            return entries, stats
 
         status = body.get("status")
         if status != "success":
-            LOG.error("Loki query failed (status=%s): %s", status, body)
-            return entries
+            stats.failed = True
+            LOG.debug("Loki query failed (status=%s): %s", status, body)
+            return entries, stats
 
         streams = body.get("data", {}).get("result", [])
         batch_count = 0
@@ -523,7 +565,7 @@ def _loki_fetch_chunk(
         else:
             break
 
-    return entries
+    return entries, stats
 
 
 def _read_flows_loki(
@@ -541,6 +583,7 @@ def _read_flows_loki(
     threads: int = 8,
     chunk_seconds: float = 5,
     timeout: int = 30,
+    retries: int = 3,
 ) -> LokiResult:
     """Fetch flows from a Loki instance.
 
@@ -580,6 +623,8 @@ def _read_flows_loki(
         time out.
     timeout:
         HTTP request timeout in seconds (default: 30).
+    retries:
+        Number of retries per chunk on transient errors (default: 3).
     """
     now = time.time()
     start_ns = int((now - since_seconds) * 1_000_000_000)
@@ -610,13 +655,17 @@ def _read_flows_loki(
     segments = [(boundaries[i], boundaries[i + 1]) for i in range(num_chunks)]
 
     interrupted = False
+    total_retries = 0
+    total_failed = 0
 
     if len(segments) <= 1:
         # Fast path: single chunk, no thread pool overhead.
         try:
-            entries = _loki_fetch_chunk(
-                base, query, start_ns, end_ns, limit, headers, ssl_ctx, timeout
+            entries, stats = _loki_fetch_chunk(
+                base, query, start_ns, end_ns, limit, headers, ssl_ctx, timeout, retries
             )
+            total_retries += stats.retries
+            total_failed += int(stats.failed)
         except KeyboardInterrupt:
             interrupted = True
             entries = []
@@ -626,12 +675,17 @@ def _read_flows_loki(
         done = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
             futures = [
-                pool.submit(_loki_fetch_chunk, base, query, s, e, limit, headers, ssl_ctx, timeout)
+                pool.submit(
+                    _loki_fetch_chunk, base, query, s, e, limit, headers, ssl_ctx, timeout, retries
+                )
                 for s, e in segments
             ]
             try:
                 for future in concurrent.futures.as_completed(futures):
-                    all_entries.extend(future.result())
+                    chunk_entries, stats = future.result()
+                    all_entries.extend(chunk_entries)
+                    total_retries += stats.retries
+                    total_failed += int(stats.failed)
                     done += 1
                     pct = done * 100 // len(segments)
                     print(
@@ -648,11 +702,23 @@ def _read_flows_loki(
 
         entries = all_entries
 
+    if total_retries or total_failed:
+        parts = []
+        if total_retries:
+            parts.append(f"{total_retries} retries")
+        if total_failed:
+            parts.append(f"{total_failed} chunks failed")
+        print(
+            f"  WARNING: {', '.join(parts)} due to timeouts "
+            f"(consider --loki-timeout or --loki-chunk)",
+            file=sys.stderr,
+        )
+
     entries.sort(key=lambda x: x[0])
     LOG.debug("Fetched %d log entries from Loki", len(entries))
 
     flows = [(lineno, flow) for lineno, (_, flow) in enumerate(entries, 1)]
-    return LokiResult(flows=flows, partial=interrupted)
+    return LokiResult(flows=flows, partial=interrupted or total_failed > 0)
 
 
 def parse_flows(
@@ -1562,7 +1628,7 @@ def _draw_loki_header(
     # Row 1: time range + flow count + status badge
     prefix = f"Range: since={since} until={until}  |  Flows: {flow_count}  "
     if partial:
-        badge = f"* Partial results (interrupted) -- {load_seconds:.1f}s"
+        badge = f"* Partial results -- {load_seconds:.1f}s"
         badge_attr = curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
     else:
         badge = f"* Loaded in {load_seconds:.1f}s"
@@ -1666,8 +1732,18 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
     since_sec = _parse_duration(args.since)
     until_sec = _parse_duration(args.until)
     loki_query = _loki_enrich_query(args.loki_query, namespaces)
-    chunk_default = "5m" if namespaces else "5s"
-    chunk_sec = _parse_duration(args.loki_chunk or chunk_default)
+    if args.loki_chunk:
+        chunk_sec = _parse_duration(args.loki_chunk)
+    elif namespaces:
+        # Scale chunk size so we never exceed ~48 chunks.  For short
+        # ranges this floors at 5 minutes; for long ranges (e.g. 24h)
+        # it grows automatically (e.g. 30m) to avoid excessive HTTP
+        # requests and cascading timeouts.
+        max_chunks = 48
+        range_sec = since_sec - until_sec
+        chunk_sec = max(300.0, range_sec / max_chunks)
+    else:
+        chunk_sec = 5.0
 
     print(
         f"Querying Loki at {args.loki_url} "
@@ -1690,6 +1766,7 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
         threads=args.loki_threads,
         chunk_seconds=chunk_sec,
         timeout=args.loki_timeout,
+        retries=args.loki_retries,
     )
     load_elapsed = time.monotonic() - t0
     partial = result.partial
@@ -1697,7 +1774,7 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
 
     if partial:
         print(
-            f"Interrupted -- continuing with {len(loki_flows)} flows "
+            f"Partial results -- continuing with {len(loki_flows)} flows "
             f"fetched in {load_elapsed:.1f}s.",
             file=sys.stderr,
         )
@@ -2445,14 +2522,22 @@ Loki backend (query flows stored in Grafana Loki):
         default=None,
         metavar="DURATION",
         help="Max time window per Loki request, e.g. 5s, 30s, 1m "
-        "(default: 5m when -n/--namespace filters are active, 5s otherwise)",
+        "(default: auto-scaled to ~48 chunks when -n/--namespace filters are active, "
+        "min 5m; 5s otherwise)",
     )
     loki_group.add_argument(
         "--loki-timeout",
         type=int,
-        default=30,
+        default=60,
         metavar="SECONDS",
-        help="HTTP request timeout in seconds for each Loki request (default: 30)",
+        help="HTTP request timeout in seconds for each Loki request (default: 60)",
+    )
+    loki_group.add_argument(
+        "--loki-retries",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Number of retries per chunk on transient errors like timeouts (default: 3)",
     )
 
     parser.add_argument(
@@ -2502,8 +2587,14 @@ def main() -> None:
         since_sec = _parse_duration(args.since)
         until_sec = _parse_duration(args.until)
         loki_query = _loki_enrich_query(args.loki_query, namespaces)
-        chunk_default = "5m" if namespaces else "5s"
-        chunk_sec = _parse_duration(args.loki_chunk or chunk_default)
+        if args.loki_chunk:
+            chunk_sec = _parse_duration(args.loki_chunk)
+        elif namespaces:
+            max_chunks = 48
+            range_sec = since_sec - until_sec
+            chunk_sec = max(300.0, range_sec / max_chunks)
+        else:
+            chunk_sec = 5.0
         print(
             f"Querying Loki at {args.loki_url} "
             f"(query={loki_query!r}, since={args.since}, until={args.until}) ...",
@@ -2523,10 +2614,11 @@ def main() -> None:
             threads=args.loki_threads,
             chunk_seconds=chunk_sec,
             timeout=args.loki_timeout,
+            retries=args.loki_retries,
         )
         if loki_result.partial:
             print(
-                f"Interrupted -- generating output from {len(loki_result.flows)} "
+                f"Partial results -- generating output from {len(loki_result.flows)} "
                 f"flows fetched so far.",
                 file=sys.stderr,
             )

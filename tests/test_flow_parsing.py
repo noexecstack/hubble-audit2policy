@@ -785,23 +785,33 @@ class TestLokiAuth:
 
     def test_enrich_query_no_namespaces(self) -> None:
         q = '{container="cilium-agent"}'
-        assert h._loki_enrich_query(q, []) == q
-        assert h._loki_enrich_query(q, set()) == q
+        verdict = r' |= "\"verdict\":"'
+        assert h._loki_enrich_query(q, []) == q + verdict
+        assert h._loki_enrich_query(q, set()) == q + verdict
 
     def test_enrich_query_single_namespace(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, ["argocd"])
-        assert result == r'{container="cilium-agent"} |= "\"namespace\":\"argocd\""'
+        assert result == (
+            r'{container="cilium-agent"} |= "\"verdict\":"'
+            r' |= "\"namespace\":\"argocd\""'
+        )
 
     def test_enrich_query_multiple_namespaces(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, ["monitoring", "argocd"])
-        assert result == r'{container="cilium-agent"} |~ "\"namespace\":\"(argocd|monitoring)\""'
+        assert result == (
+            r'{container="cilium-agent"} |= "\"verdict\":"'
+            r' |~ "\"namespace\":\"(argocd|monitoring)\""'
+        )
 
     def test_enrich_query_deduplicates(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, ["argocd", "argocd"])
-        assert result == r'{container="cilium-agent"} |= "\"namespace\":\"argocd\""'
+        assert result == (
+            r'{container="cilium-agent"} |= "\"verdict\":"'
+            r' |= "\"namespace\":\"argocd\""'
+        )
 
     def test_build_loki_ssl_context_none(self) -> None:
         assert h._build_loki_ssl_context(None) is None
