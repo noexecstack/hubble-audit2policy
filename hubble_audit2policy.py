@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.14.1"
+__version__ = "0.14.2"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -782,7 +782,7 @@ def _read_flows_loki(
         entries = all_entries
 
     if total_retries or total_failed:
-        parts = []
+        parts: list[str] = []
         if total_retries:
             parts.append(f"{total_retries} retries")
         if total_failed:
