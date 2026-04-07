@@ -813,6 +813,35 @@ class TestLokiAuth:
             r' |= "\"namespace\":\"argocd\""'
         )
 
+    def test_enrich_query_single_verdict(self) -> None:
+        q = '{container="cilium-agent"}'
+        result = h._loki_enrich_query(q, [], verdicts=["AUDIT"])
+        assert result == (
+            r'{container="cilium-agent"} |= "\"verdict\":\"AUDIT\""'
+        )
+
+    def test_enrich_query_multiple_verdicts(self) -> None:
+        q = '{container="cilium-agent"}'
+        result = h._loki_enrich_query(q, [], verdicts=["DROPPED", "AUDIT"])
+        assert result == (
+            r'{container="cilium-agent"} |~ "\"verdict\":\"(AUDIT|DROPPED)\""'
+        )
+
+    def test_enrich_query_verdict_deduplicates(self) -> None:
+        q = '{container="cilium-agent"}'
+        result = h._loki_enrich_query(q, [], verdicts=["AUDIT", "AUDIT"])
+        assert result == (
+            r'{container="cilium-agent"} |= "\"verdict\":\"AUDIT\""'
+        )
+
+    def test_enrich_query_verdict_and_namespace(self) -> None:
+        q = '{container="cilium-agent"}'
+        result = h._loki_enrich_query(q, ["argocd"], verdicts=["AUDIT"])
+        assert result == (
+            r'{container="cilium-agent"} |= "\"verdict\":\"AUDIT\""'
+            r' |= "\"namespace\":\"argocd\""'
+        )
+
     def test_build_loki_ssl_context_none(self) -> None:
         assert h._build_loki_ssl_context(None) is None
         assert h._build_loki_ssl_context("") is None

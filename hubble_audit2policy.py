@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -17,6 +17,7 @@ import base64
 import concurrent.futures
 import curses
 import dataclasses
+import gzip
 import io
 import json
 import logging
@@ -33,7 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict, deque
-from collections.abc import Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from typing import IO, Any, ClassVar, cast
 
@@ -60,13 +61,12 @@ ParseResult = tuple[
 ]
 
 
-# Result from _read_flows_loki().
+@dataclasses.dataclass
 class LokiResult:
-    __slots__ = ("flows", "partial")
+    """Result from ``_read_flows_loki()``."""
 
-    def __init__(self, flows: list[tuple[int, dict[str, Any]]], partial: bool) -> None:
-        self.flows = flows
-        self.partial = partial
+    flows: list[tuple[int, dict[str, Any]]]
+    partial: bool
 
 
 # Exit codes
@@ -424,11 +424,8 @@ def _build_loki_ssl_context(
 ) -> ssl.SSLContext | None:
     """Return an SSL context for Loki requests, or *None* for defaults.
 
-    Parameters
-    ----------
-    ca_cert:
-        Path to a PEM-encoded CA certificate file for verifying the
-        Loki server certificate (useful for self-signed certs).
+    *ca_cert* is the path to a PEM-encoded CA certificate file for
+    verifying the Loki server certificate (useful for self-signed certs).
     """
     if not ca_cert:
         return None
@@ -436,24 +433,38 @@ def _build_loki_ssl_context(
     return ctx
 
 
-def _loki_enrich_query(query: str, namespaces: Iterable[str]) -> str:
-    r"""Append LogQL line filters for *namespaces* to *query*.
+def _loki_enrich_query(
+    query: str,
+    namespaces: Iterable[str],
+    verdicts: Iterable[str] = (),
+) -> str:
+    r"""Append LogQL line filters for *verdicts* and *namespaces* to *query*.
 
-    Always adds a ``"verdict":`` filter so only actual Hubble flow records
+    Always adds a ``"verdict"`` filter so only actual Hubble flow records
     are returned (cilium-agent emits many other JSON log lines that would
     otherwise bloat results and can exceed Loki gRPC size limits).
+
+    When specific *verdicts* are given (e.g. ``{"AUDIT"}``), the filter
+    is narrowed to match only those values so Loki discards non-matching
+    flows server-side instead of shipping them over the wire.
 
     When the user passes ``-n argocd``, we additionally inject a filter
     that matches the JSON field pattern ``"namespace":"argocd"`` so Loki
     filters lines server-side.
 
-    Multiple namespaces are OR-joined into a single regex filter, e.g.
-    ``"namespace":"(argocd|monitoring)"``.
+    Multiple namespaces/verdicts are OR-joined into a single regex filter.
     """
-    # Every Hubble flow record contains "verdict": -- filter non-flow
-    # log lines server-side to avoid downloading megabytes of irrelevant
-    # cilium-agent logs.
-    query += r' |= "\"verdict\":"'
+    # Verdict filter -- push as specific a match as possible so Loki
+    # discards non-matching lines before sending them to us.
+    verdict_list = sorted(set(verdicts))
+    if len(verdict_list) == 1:
+        query += r' |= "\"verdict\":\"' + verdict_list[0] + r'\""'
+    elif len(verdict_list) > 1:
+        vpat = "|".join(re.escape(v) for v in verdict_list)
+        query += r' |~ "\"verdict\":\"(' + vpat + r')\""'
+    else:
+        # No specific verdict -- still filter to flow records only.
+        query += r' |= "\"verdict\":"'
 
     ns_list = sorted(set(namespaces))
     if not ns_list:
@@ -462,6 +473,81 @@ def _loki_enrich_query(query: str, namespaces: Iterable[str]) -> str:
         return query + r' |= "\"namespace\":\"' + ns_list[0] + r'\""'
     pattern = "|".join(re.escape(ns) for ns in ns_list)
     return query + r' |~ "\"namespace\":\"(' + pattern + r')\""'
+
+
+class _LokiProgress:
+    """Live progress indicator for Loki fetches.
+
+    Runs a background thread that prints elapsed time and a spinner every
+    second so the user always sees activity, even while a slow chunk is
+    being processed server-side.
+    """
+
+    _SPINNER = "|/-\\"
+
+    def __init__(self, total_chunks: int) -> None:
+        self._total = total_chunks
+        self._done = 0
+        self._flows = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._start = time.monotonic()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    # -- public API ----------------------------------------------------------
+
+    def start(self) -> _LokiProgress:
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        # Clear the line and leave a final summary.
+        elapsed = time.monotonic() - self._start
+        print(
+            f"\r  Fetched {self._flows} flows in {self._fmt_elapsed(elapsed)}                    ",
+            file=sys.stderr,
+        )
+
+    def chunk_done(self, new_flows: int) -> None:
+        with self._lock:
+            self._done += 1
+            self._flows += new_flows
+
+    # -- internals -----------------------------------------------------------
+
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        m, s = divmod(int(seconds), 60)
+        if m:
+            return f"{m}m{s:02d}s"
+        return f"{s}s"
+
+    def _run(self) -> None:
+        tick = 0
+        while not self._stop.wait(0.25):
+            tick += 1
+            with self._lock:
+                done, flows = self._done, self._flows
+            elapsed = time.monotonic() - self._start
+            spin = self._SPINNER[tick % len(self._SPINNER)]
+            if self._total > 1:
+                pct = done * 100 // self._total
+                msg = (
+                    f"\r  {spin} [{done}/{self._total}] {pct}% "
+                    f"-- {flows} flows -- {self._fmt_elapsed(elapsed)}"
+                )
+            else:
+                msg = f"\r  {spin} Querying Loki -- {flows} flows -- {self._fmt_elapsed(elapsed)}"
+            # Pad to overwrite previous longer lines.
+            print(f"{msg: <72}", end="", file=sys.stderr)
+
+    def __enter__(self) -> _LokiProgress:
+        return self.start()
+
+    def __exit__(self, *_: object) -> None:
+        self.stop()
 
 
 @dataclasses.dataclass
@@ -509,11 +595,15 @@ def _loki_fetch_chunk(
         LOG.debug("Loki request: %s", url)
 
         req = urllib.request.Request(url, headers=headers)
+        req.add_header("Accept-Encoding", "gzip")
         body: dict[str, Any] | None = None
         for attempt in range(1 + retries):
             try:
                 with urllib.request.urlopen(req, timeout=timeout, context=ssl_ctx) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
+                    raw = resp.read()
+                    if resp.headers.get("Content-Encoding") == "gzip":
+                        raw = gzip.decompress(raw)
+                    body = json.loads(raw.decode("utf-8"))
                 break
             except (urllib.error.URLError, OSError) as exc:
                 if attempt < retries:
@@ -587,7 +677,7 @@ def _read_flows_loki(
 ) -> LokiResult:
     """Fetch flows from a Loki instance.
 
-    Returns a `LokiResult` with *(lineno, flow_dict)* pairs and a
+    Returns a ``LokiResult`` with *(lineno, flow_dict)* pairs and a
     *partial* flag indicating whether the fetch was interrupted.
 
     The query time range is split into small time chunks (controlled by
@@ -595,36 +685,20 @@ def _read_flows_loki(
     *threads* workers, then merged in timestamp order with monotonically
     increasing line numbers.
 
-    Parameters
-    ----------
-    loki_url:
-        Base URL of the Loki instance, e.g. ``http://loki:3100``.
-    query:
-        LogQL stream selector, e.g. ``{container="cilium-agent"}``.
-    since_seconds:
-        Start of the query window as seconds before *now*.
-    until_seconds:
-        End of the query window as seconds before *now* (0 = now).
-    limit:
-        Maximum number of log entries per request batch.
-    loki_user:
-        Username for HTTP Basic authentication.
-    loki_password:
-        Password for HTTP Basic authentication.
-    loki_token:
-        Bearer token for ``Authorization: Bearer ...`` header.
-    loki_tls_ca:
-        Path to a PEM CA certificate for TLS verification.
-    threads:
-        Number of parallel worker threads (default: 4).
-    chunk_seconds:
-        Maximum time window per Loki request in seconds (default: 30).
-        Smaller chunks reduce per-request load and are less likely to
-        time out.
-    timeout:
-        HTTP request timeout in seconds (default: 30).
-    retries:
-        Number of retries per chunk on transient errors (default: 3).
+    *loki_url* is the base URL (e.g. ``http://loki:3100``).  *query* is
+    the LogQL stream selector.  The window spans from *since_seconds*
+    before now to *until_seconds* before now (0 = now).
+
+    *limit* caps entries per request batch.  *loki_user* / *loki_password*
+    enable HTTP Basic auth; *loki_token* sets a Bearer token instead.
+    *loki_tls_ca* points to a PEM CA certificate for TLS verification.
+    *loki_org_id* sets the ``X-Scope-OrgID`` header for multi-tenant Loki.
+
+    *threads* controls the parallel worker count (default: 8).
+    *chunk_seconds* sets the max time window per request (default: 5);
+    smaller chunks reduce per-request load and are less likely to time
+    out.  *timeout* is the HTTP timeout per request (default: 30).
+    *retries* is the retry count on transient errors (default: 3).
     """
     now = time.time()
     start_ns = int((now - since_seconds) * 1_000_000_000)
@@ -660,23 +734,36 @@ def _read_flows_loki(
 
     if len(segments) <= 1:
         # Fast path: single chunk, no thread pool overhead.
-        try:
-            entries, stats = _loki_fetch_chunk(
-                base, query, start_ns, end_ns, limit, headers, ssl_ctx, timeout, retries
-            )
-            total_retries += stats.retries
-            total_failed += int(stats.failed)
-        except KeyboardInterrupt:
-            interrupted = True
-            entries = []
+        with _LokiProgress(1) as progress:
+            try:
+                entries, stats = _loki_fetch_chunk(
+                    base, query, start_ns, end_ns, limit, headers, ssl_ctx, timeout, retries
+                )
+                total_retries += stats.retries
+                total_failed += int(stats.failed)
+                progress.chunk_done(len(entries))
+            except KeyboardInterrupt:
+                interrupted = True
+                entries = []
     else:
         num_workers = min(threads, len(segments))
         all_entries: list[tuple[int, dict[str, Any]]] = []
-        done = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+        with (
+            _LokiProgress(len(segments)) as progress,
+            concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool,
+        ):
             futures = [
                 pool.submit(
-                    _loki_fetch_chunk, base, query, s, e, limit, headers, ssl_ctx, timeout, retries
+                    _loki_fetch_chunk,
+                    base,
+                    query,
+                    s,
+                    e,
+                    limit,
+                    headers,
+                    ssl_ctx,
+                    timeout,
+                    retries,
                 )
                 for s, e in segments
             ]
@@ -686,19 +773,11 @@ def _read_flows_loki(
                     all_entries.extend(chunk_entries)
                     total_retries += stats.retries
                     total_failed += int(stats.failed)
-                    done += 1
-                    pct = done * 100 // len(segments)
-                    print(
-                        f"\r  Fetched chunk {done}/{len(segments)} ({pct}%) "
-                        f"-- {len(all_entries)} flows so far ...",
-                        end="",
-                        file=sys.stderr,
-                    )
+                    progress.chunk_done(len(chunk_entries))
             except KeyboardInterrupt:
                 interrupted = True
                 for f in futures:
                     f.cancel()
-        print(file=sys.stderr)  # newline after progress
 
         entries = all_entries
 
@@ -763,7 +842,7 @@ def parse_flows(
         if _apply_flow(flow, label_keys, namespaces, policies, flow_counts, app_pods):
             matched += 1
 
-    return policies, flow_counts, total, matched, dict(app_pods)
+    return dict(policies), flow_counts, total, matched, dict(app_pods)
 
 
 def _apply_flow(
@@ -1047,6 +1126,7 @@ def _print_unknown_warnings(
 
 
 def _print_summary(total: int, matched: int, policy_count: int, file: IO[str] = sys.stderr) -> None:
+    """Print a one-line processing summary to *file*."""
     count_word = "policy" if policy_count == 1 else "policies"
     print(
         f"Processed {total} flows - {matched} matched - {policy_count} {count_word} generated.",
@@ -1094,8 +1174,8 @@ def _print_report(
     max_proto = max(max_proto, 5)
 
     # Fixed overhead per row: COUNT(7) + 2 + "->"(2) + 2 + PORT(5) + 2 + PROTO + gaps(6)
-    FIXED = 7 + 2 + 2 + 2 + 5 + 2 + max_proto + 4
-    available = max(term_width - FIXED, 20)
+    fixed = 7 + 2 + 2 + 2 + 5 + 2 + max_proto + 4
+    available = max(term_width - fixed, 20)
 
     # Distribute available space between the two name columns.
     total_natural = max_src + max_dst
@@ -1107,7 +1187,7 @@ def _print_report(
         src_col = max(10, int(available * max_src / total_natural))
         dst_col = max(10, available - src_col)
 
-    row_len = FIXED + src_col + dst_col
+    row_len = fixed + src_col + dst_col
     sep = "=" * row_len
     dash = "-" * row_len
 
@@ -1702,7 +1782,214 @@ def _draw_content(
             pass
 
 
-def _loki_watch_mode(args: argparse.Namespace) -> None:
+# -- Shared TUI infrastructure ---------------------------------------------
+
+# Type aliases for TUI callbacks.
+#   refresh_fn(term_width, now_monotonic) -> (ordered_keys, content_lines)
+RefreshFn = Callable[[int, float], tuple[list[FlowKey], list[str]]]
+#   draw_header_fn(stdscr, width, is_paused, is_selecting, selected_count, now_mono)
+DrawHeaderFn = Callable[[Any, int, bool, bool, int, float], None]
+
+
+@dataclasses.dataclass
+class _TuiResult:
+    """Outcome of a curses TUI session."""
+
+    final_content: list[str] = dataclasses.field(default_factory=lambda: list[str]())
+    generate: bool = False
+    selected_keys: set[FlowKey] = dataclasses.field(default_factory=lambda: set[FlowKey]())
+
+
+def _build_report_content(
+    flow_counts: Counter[FlowKey],
+    total: int,
+    matched: int,
+    width: int,
+    help_text: str,
+) -> tuple[list[FlowKey], list[str]]:
+    """Render the flow report and help line into *(ordered_keys, content_lines)*."""
+    buf = io.StringIO()
+    ordered_keys = _print_report(flow_counts, total, matched, file=buf, term_width=width)
+    unknown_keys = _find_unknown_flows(flow_counts)
+    if unknown_keys:
+        _print_unknown_warnings(unknown_keys, flow_counts, file=buf)
+    buf.write(help_text)
+    return ordered_keys, buf.getvalue().splitlines()
+
+
+def _run_tui(
+    *,
+    interval: float,
+    supports_pause: bool,
+    refresh_fn: RefreshFn,
+    draw_header_fn: DrawHeaderFn,
+) -> _TuiResult:
+    """Run the shared curses TUI loop used by both live and Loki watch modes.
+
+    *refresh_fn(width, now_mono)* fetches data and returns
+    *(ordered_keys, content_lines)*.  *draw_header_fn* renders mode-specific
+    header rows.  When *supports_pause* is ``True``, the Space key pauses
+    live refresh; otherwise it only toggles selection in select mode.
+    """
+    header_lines = 4
+    data_row_offset = 6
+    result = _TuiResult()
+
+    def _run(stdscr: Any) -> None:
+        if curses.has_colors():
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_GREEN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+            curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+
+        scroll_offset = 0
+        is_following = True
+        is_paused = False
+        is_selecting = False
+        cursor_flow_idx = 0
+        selected_keys: set[FlowKey] = set()
+
+        ordered_keys: list[FlowKey] = []
+        key_map: dict[int, FlowKey] = {}
+        content_lines: list[str] = []
+        last_refresh = 0.0
+
+        while True:
+            key = stdscr.getch()
+            height, width = stdscr.getmaxyx()
+            half_page = max(1, (height - header_lines) // 2)
+
+            if key != -1:
+                (
+                    quit_sig,
+                    is_paused,
+                    is_selecting,
+                    cursor_flow_idx,
+                    scroll_offset,
+                    is_following,
+                    gen,
+                ) = _handle_key(
+                    key,
+                    is_paused=is_paused,
+                    is_selecting=is_selecting,
+                    cursor_flow_idx=cursor_flow_idx,
+                    ordered_keys=ordered_keys,
+                    selected_keys=selected_keys,
+                    scroll_offset=scroll_offset,
+                    is_following=is_following,
+                    half_page=half_page,
+                    content_lines_len=len(content_lines),
+                )
+                if quit_sig:
+                    if gen:
+                        result.generate = True
+                        result.selected_keys.update(selected_keys)
+                    break
+                if key == 27:
+                    selected_keys.clear()
+
+            now_mono = time.monotonic()
+
+            # Refresh (skipped while paused in live mode).
+            should_refresh = now_mono - last_refresh >= interval
+            if supports_pause and is_paused:
+                should_refresh = False
+
+            if should_refresh:
+                last_refresh = now_mono
+                ordered_keys, content_lines = refresh_fn(width, now_mono)
+                key_map = {data_row_offset + i: fk for i, fk in enumerate(ordered_keys)}
+                result.final_content = content_lines
+
+                if ordered_keys:
+                    cursor_flow_idx = min(cursor_flow_idx, len(ordered_keys) - 1)
+                else:
+                    cursor_flow_idx = 0
+
+            # Clamp scroll / auto-follow.
+            content_viewport = max(1, height - header_lines)
+            max_scroll = max(0, len(content_lines) - content_viewport)
+
+            if is_following:
+                scroll_offset = 0
+            else:
+                scroll_offset = min(scroll_offset, max_scroll)
+                if scroll_offset <= 0:
+                    is_following = True
+
+            if is_selecting and ordered_keys:
+                cursor_line = data_row_offset + cursor_flow_idx
+                if not is_following:
+                    if cursor_line < scroll_offset:
+                        scroll_offset = cursor_line
+                    elif cursor_line >= scroll_offset + content_viewport:
+                        scroll_offset = min(cursor_line - content_viewport + 1, max_scroll)
+
+            # Draw.
+            stdscr.erase()
+            draw_header_fn(stdscr, width, is_paused, is_selecting, len(selected_keys), now_mono)
+            _draw_content(
+                stdscr,
+                width,
+                height,
+                content_lines=content_lines,
+                scroll_offset=scroll_offset,
+                is_selecting=is_selecting,
+                is_following=is_following,
+                cursor_flow_idx=cursor_flow_idx,
+                key_map=key_map,
+                selected_keys=selected_keys,
+                header_lines=header_lines,
+                data_row_offset=data_row_offset,
+            )
+            stdscr.refresh()
+            time.sleep(0.05)
+
+    try:
+        curses.wrapper(_run)
+    except KeyboardInterrupt:
+        pass
+
+    return result
+
+
+def _handle_tui_result(
+    result: _TuiResult,
+    args: argparse.Namespace,
+    exit_message: str,
+) -> None:
+    """Print final report and generate policies from TUI selection."""
+    if result.final_content:
+        print()
+        for line in result.final_content:
+            print(line)
+
+    if result.generate and result.selected_keys:
+        policies = _build_policies_from_flow_keys(result.selected_keys)
+        sorted_policies = [(ns, app, rules) for (ns, app), rules in sorted(policies.items())]
+        n_pol = len(sorted_policies)
+        print(
+            f"\nGenerating {n_pol} {'policy' if n_pol == 1 else 'policies'} "
+            f"from {len(result.selected_keys)} selected flows...",
+            file=sys.stderr,
+        )
+        if args.dry_run:
+            _write_multi_doc_yaml(sorted_policies, sys.stdout)
+        else:
+            written = _write_policy_dir(sorted_policies, args.output_dir)
+            print(
+                f"Wrote {written} {'policy' if written == 1 else 'policies'} "
+                f"to {os.path.realpath(args.output_dir)}",
+                file=sys.stderr,
+            )
+
+    print(f"\n{exit_message}", file=sys.stderr)
+
+
+def _loki_watch_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     """Interactive TUI for Loki flows with workload selection.
 
     Fetches historical flows from a Loki instance, then presents the same
@@ -1720,30 +2007,21 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
 
     # Validate Loki arguments.
     if not args.loki_url:
-        LOG.error("--loki-url is required when using --from loki")
-        sys.exit(EXIT_ERROR)
+        parser.error("--loki-url is required when using --from loki")
     if args.loki_token and args.loki_user:
-        LOG.error("--loki-token and --loki-user are mutually exclusive")
-        sys.exit(EXIT_ERROR)
+        parser.error("--loki-token and --loki-user are mutually exclusive")
     if args.loki_password and not args.loki_user:
-        LOG.error("--loki-password requires --loki-user")
-        sys.exit(EXIT_ERROR)
+        parser.error("--loki-password requires --loki-user")
 
     since_sec = _parse_duration(args.since)
     until_sec = _parse_duration(args.until)
-    loki_query = _loki_enrich_query(args.loki_query, namespaces)
+    loki_query = _loki_enrich_query(args.loki_query, namespaces, verdicts)
     if args.loki_chunk:
         chunk_sec = _parse_duration(args.loki_chunk)
-    elif namespaces:
-        # Scale chunk size so we never exceed ~48 chunks.  For short
-        # ranges this floors at 5 minutes; for long ranges (e.g. 24h)
-        # it grows automatically (e.g. 30m) to avoid excessive HTTP
-        # requests and cascading timeouts.
+    else:
         max_chunks = 48
         range_sec = since_sec - until_sec
         chunk_sec = max(300.0, range_sec / max_chunks)
-    else:
-        chunk_sec = 5.0
 
     print(
         f"Querying Loki at {args.loki_url} "
@@ -1791,186 +2069,43 @@ def _loki_watch_mode(args: argparse.Namespace) -> None:
             LOG.warning("No flows returned from Loki query")
         sys.exit(EXIT_NO_POLICIES)
 
-    # Header layout matches live watch mode.
-    HEADER_LINES = 4
-    DATA_ROW_OFFSET = 6
+    help_text = "\nj/k line  |  d/u half-page  |  g/G top/bottom  |  s select  |  q quit\n"
 
-    # Shared state between _run() and the outer scope.
-    final_content: list[str] = []
-    generate_flag: bool = False
-    selected_keys_final: set[FlowKey] = set()
-
-    def _run(stdscr: curses.window) -> None:  # type: ignore[name-defined]
-        nonlocal final_content, generate_flag
-        if curses.has_colors():
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_GREEN, -1)
-            curses.init_pair(2, curses.COLOR_YELLOW, -1)
-            curses.init_pair(3, curses.COLOR_RED, -1)
-        curses.curs_set(0)
-        stdscr.nodelay(True)
-        stdscr.keypad(True)
-
-        scroll_offset = 0
-        is_following = True
-        is_paused = False
-        is_selecting = False
-        cursor_flow_idx = 0
-        selected_keys: set[FlowKey] = set()
-
-        ordered_keys: list[FlowKey] = []
-        key_map: dict[int, FlowKey] = {}
-        content_lines: list[str] = []
-        last_refresh = 0.0
-
-        while True:
-            key = stdscr.getch()
-            height, width = stdscr.getmaxyx()
-            half_page = max(1, (height - HEADER_LINES) // 2)
-
-            if key != -1:
-                (
-                    quit_sig,
-                    is_paused,
-                    is_selecting,
-                    cursor_flow_idx,
-                    scroll_offset,
-                    is_following,
-                    gen,
-                ) = _handle_key(
-                    key,
-                    is_paused=is_paused,
-                    is_selecting=is_selecting,
-                    cursor_flow_idx=cursor_flow_idx,
-                    ordered_keys=ordered_keys,
-                    selected_keys=selected_keys,
-                    scroll_offset=scroll_offset,
-                    is_following=is_following,
-                    half_page=half_page,
-                    content_lines_len=len(content_lines),
-                )
-                if quit_sig:
-                    if gen:
-                        generate_flag = True
-                        selected_keys_final.update(selected_keys)
-                    break
-                if key == 27:
-                    selected_keys.clear()
-
-            now_mono = time.monotonic()
-
-            # Refresh the report periodically.
-            if now_mono - last_refresh >= interval:
-                last_refresh = now_mono
-
-                _, flow_counts, total, matched, _ = _parse_flow_list(
-                    loki_flows, label_keys, verdicts, namespaces
-                )
-
-                buf = io.StringIO()
-                ordered_keys = _print_report(
-                    flow_counts, total, matched, file=buf, term_width=width
-                )
-                key_map = {DATA_ROW_OFFSET + i: fk for i, fk in enumerate(ordered_keys)}
-
-                unknown_keys = _find_unknown_flows(flow_counts)
-                if unknown_keys:
-                    _print_unknown_warnings(unknown_keys, flow_counts, file=buf)
-
-                buf.write(
-                    "\nj/k line  |  d/u half-page  |  g/G top/bottom  |  s select  |  q quit\n"
-                )
-                content_lines = buf.getvalue().splitlines()
-                final_content = content_lines
-
-                if ordered_keys:
-                    cursor_flow_idx = min(cursor_flow_idx, len(ordered_keys) - 1)
-                else:
-                    cursor_flow_idx = 0
-
-            # Clamp scroll / auto-follow.
-            content_viewport = max(1, height - HEADER_LINES)
-            max_scroll = max(0, len(content_lines) - content_viewport)
-
-            if is_following:
-                scroll_offset = 0
-            else:
-                scroll_offset = min(scroll_offset, max_scroll)
-                if scroll_offset <= 0:
-                    is_following = True
-
-            if is_selecting and ordered_keys:
-                cursor_line = DATA_ROW_OFFSET + cursor_flow_idx
-                if not is_following:
-                    if cursor_line < scroll_offset:
-                        scroll_offset = cursor_line
-                    elif cursor_line >= scroll_offset + content_viewport:
-                        scroll_offset = min(cursor_line - content_viewport + 1, max_scroll)
-
-            # Draw.
-            stdscr.erase()
-            _draw_loki_header(
-                stdscr,
-                width,
-                loki_url=args.loki_url,
-                loki_query=args.loki_query,
-                since=args.since,
-                until=args.until,
-                flow_count=len(loki_flows),
-                load_seconds=load_elapsed,
-                is_selecting=is_selecting,
-                partial=partial,
-                selected_count=len(selected_keys),
-            )
-            _draw_content(
-                stdscr,
-                width,
-                height,
-                content_lines=content_lines,
-                scroll_offset=scroll_offset,
-                is_selecting=is_selecting,
-                is_following=is_following,
-                cursor_flow_idx=cursor_flow_idx,
-                key_map=key_map,
-                selected_keys=selected_keys,
-                header_lines=HEADER_LINES,
-                data_row_offset=DATA_ROW_OFFSET,
-            )
-            stdscr.refresh()
-            time.sleep(0.05)
-
-    try:
-        curses.wrapper(_run)
-    except KeyboardInterrupt:
-        pass
-
-    # Print the last snapshot so the user is not left with a blank screen.
-    if final_content:
-        print()
-        for line in final_content:
-            print(line)
-
-    # Generate policies from selected flows (triggered by Enter in select mode).
-    if generate_flag and selected_keys_final:
-        policies = _build_policies_from_flow_keys(selected_keys_final)
-        sorted_policies = [(ns, app, rules) for (ns, app), rules in sorted(policies.items())]
-        n_pol = len(sorted_policies)
-        print(
-            f"\nGenerating {n_pol} {'policy' if n_pol == 1 else 'policies'} "
-            f"from {len(selected_keys_final)} selected flows...",
-            file=sys.stderr,
+    def refresh_fn(width: int, _now_mono: float) -> tuple[list[FlowKey], list[str]]:
+        _, flow_counts, total, matched, _ = _parse_flow_list(
+            loki_flows, label_keys, verdicts, namespaces
         )
-        if args.dry_run:
-            _write_multi_doc_yaml(sorted_policies, sys.stdout)
-        else:
-            written = _write_policy_dir(sorted_policies, args.output_dir)
-            print(
-                f"Wrote {written} {'policy' if written == 1 else 'policies'} "
-                f"to {os.path.realpath(args.output_dir)}",
-                file=sys.stderr,
-            )
+        return _build_report_content(flow_counts, total, matched, width, help_text)
 
-    print("\nLoki watch mode stopped.", file=sys.stderr)
+    def draw_header_fn(
+        stdscr: Any,
+        width: int,
+        _is_paused: bool,
+        is_selecting: bool,
+        selected_count: int,
+        _now_mono: float,
+    ) -> None:
+        _draw_loki_header(
+            stdscr,
+            width,
+            loki_url=args.loki_url,
+            loki_query=args.loki_query,
+            since=args.since,
+            until=args.until,
+            flow_count=len(loki_flows),
+            load_seconds=load_elapsed,
+            is_selecting=is_selecting,
+            partial=partial,
+            selected_count=selected_count,
+        )
+
+    tui_result = _run_tui(
+        interval=interval,
+        supports_pause=False,
+        refresh_fn=refresh_fn,
+        draw_header_fn=draw_header_fn,
+    )
+    _handle_tui_result(tui_result, args, "Loki watch mode stopped.")
 
 
 def _watch_mode(args: argparse.Namespace) -> None:
@@ -2046,185 +2181,57 @@ def _watch_mode(args: argparse.Namespace) -> None:
         sys.exit(EXIT_ERROR)
 
     reconn = _ReconnectState()
-
-    # Header layout (screen rows):
-    #   0  command + timestamp
-    #   1  window / connection / pause status
-    #   2  last hubble error  OR  selection mode hint
-    #   3  blank separator
-    # Scrollable content starts at row 4.
-    HEADER_LINES = 4
-
-    # _print_report always writes these many lines before the first data row:
-    #   "" (leading \n), sep, "FLOW REPORT...", sep, header-row, dash  = 6 lines
-    DATA_ROW_OFFSET = 6
-
-    # Shared state between _run() and the outer scope.
-    final_content: list[str] = []
-    generate_flag: bool = False
-    selected_keys_final: set[FlowKey] = set()
-
     capture_file_name: str | None = args.capture_file if capture_fh else None
 
-    def _run(stdscr: curses.window) -> None:  # type: ignore[name-defined]
-        nonlocal final_content, generate_flag
-        if curses.has_colors():
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_GREEN, -1)  # live / selected
-            curses.init_pair(2, curses.COLOR_YELLOW, -1)  # paused / warning
-            curses.init_pair(3, curses.COLOR_RED, -1)  # error
-        curses.curs_set(0)
-        stdscr.nodelay(True)
-        stdscr.keypad(True)
+    help_text = (
+        "\nSpace pause  |  j/k line  |  d/u half-page  |  g/G top/bottom  |  s select  |  q quit\n"
+    )
 
-        scroll_offset = 0
-        is_following = True  # auto-follow top of report (most-frequent first)
-        is_paused = False
-        is_selecting = False
-        cursor_flow_idx = 0  # index into ordered_keys when selecting
-        selected_keys: set[FlowKey] = set()
+    def refresh_fn(width: int, now_mono: float) -> tuple[list[FlowKey], list[str]]:
+        # Auto-reconnect on hubble process exit.
+        if not store.connected and proc_holder[0].poll() is not None:
+            if now_mono >= reconn.at:
+                try:
+                    proc_holder[0] = _launch_hubble(hubble_cmd, store, stop_event)
+                    reconn.reset()
+                except FileNotFoundError:
+                    reconn.backoff(now_mono)
 
-        ordered_keys: list[FlowKey] = []  # flow keys in display order (rebuilt each refresh)
-        key_map: dict[int, FlowKey] = {}  # content_line_index -> FlowKey
-        content_lines: list[str] = []
-        last_refresh = 0.0
+        flows = store.snapshot()
+        _, flow_counts, total, matched, _ = _parse_flow_list(
+            flows, label_keys, verdicts, namespaces
+        )
+        return _build_report_content(flow_counts, total, matched, width, help_text)
 
-        while True:
-            key = stdscr.getch()
-            height, width = stdscr.getmaxyx()
-            half_page = max(1, (height - HEADER_LINES) // 2)
-
-            if key != -1:
-                (
-                    quit_sig,
-                    is_paused,
-                    is_selecting,
-                    cursor_flow_idx,
-                    scroll_offset,
-                    is_following,
-                    gen,
-                ) = _handle_key(
-                    key,
-                    is_paused=is_paused,
-                    is_selecting=is_selecting,
-                    cursor_flow_idx=cursor_flow_idx,
-                    ordered_keys=ordered_keys,
-                    selected_keys=selected_keys,
-                    scroll_offset=scroll_offset,
-                    is_following=is_following,
-                    half_page=half_page,
-                    content_lines_len=len(content_lines),
-                )
-                if quit_sig:
-                    if gen:
-                        generate_flag = True
-                        selected_keys_final.update(selected_keys)
-                    break
-                # Esc clears selections inside _handle_key via the returned
-                # is_selecting=False, but the set is mutated in-place only for
-                # toggle; for Esc we need to clear here when select was exited.
-                if key == 27:
-                    selected_keys.clear()
-
-            now_mono = time.monotonic()
-
-            # ---- Auto-refresh (skipped while paused) -------------------------
-            if not is_paused and now_mono - last_refresh >= interval:
-                last_refresh = now_mono
-
-                # Auto-reconnect
-                if not store.connected and proc_holder[0].poll() is not None:
-                    if now_mono >= reconn.at:
-                        try:
-                            proc_holder[0] = _launch_hubble(hubble_cmd, store, stop_event)
-                            reconn.reset()
-                        except FileNotFoundError:
-                            reconn.backoff(now_mono)
-
-                flows = store.snapshot()
-                _, flow_counts, total, matched, _ = _parse_flow_list(
-                    flows, label_keys, verdicts, namespaces
-                )
-
-                buf = io.StringIO()
-                ordered_keys = _print_report(
-                    flow_counts, total, matched, file=buf, term_width=width
-                )
-                key_map = {DATA_ROW_OFFSET + i: fk for i, fk in enumerate(ordered_keys)}
-
-                unknown_keys = _find_unknown_flows(flow_counts)
-                if unknown_keys:
-                    _print_unknown_warnings(unknown_keys, flow_counts, file=buf)
-
-                buf.write(
-                    "\nSpace pause  |  j/k line  |  d/u half-page"
-                    "  |  g/G top/bottom  |  s select  |  q quit\n"
-                )
-                content_lines = buf.getvalue().splitlines()
-                final_content = content_lines
-
-                # Clamp cursor to valid range after data changes.
-                if ordered_keys:
-                    cursor_flow_idx = min(cursor_flow_idx, len(ordered_keys) - 1)
-                else:
-                    cursor_flow_idx = 0
-
-            # ---- Clamp scroll / auto-follow ----------------------------------
-            content_viewport = max(1, height - HEADER_LINES)
-            max_scroll = max(0, len(content_lines) - content_viewport)
-
-            if is_following:
-                scroll_offset = 0
-            else:
-                scroll_offset = min(scroll_offset, max_scroll)
-                if scroll_offset <= 0:
-                    is_following = True  # scrolled back to top -- re-enable
-
-            # In selection mode keep the cursor row visible.
-            if is_selecting and ordered_keys:
-                cursor_line = DATA_ROW_OFFSET + cursor_flow_idx
-                if not is_following:
-                    if cursor_line < scroll_offset:
-                        scroll_offset = cursor_line
-                    elif cursor_line >= scroll_offset + content_viewport:
-                        scroll_offset = min(cursor_line - content_viewport + 1, max_scroll)
-
-            # ---- Draw --------------------------------------------------------
-            stdscr.erase()
-            _draw_header(
-                stdscr,
-                width,
-                cmd_display=cmd_display,
-                interval=interval,
-                store=store,
-                capture_file=capture_file_name,
-                is_paused=is_paused,
-                is_selecting=is_selecting,
-                selected_count=len(selected_keys),
-                reconn=reconn,
-                now_mono=now_mono,
-            )
-            _draw_content(
-                stdscr,
-                width,
-                height,
-                content_lines=content_lines,
-                scroll_offset=scroll_offset,
-                is_selecting=is_selecting,
-                is_following=is_following,
-                cursor_flow_idx=cursor_flow_idx,
-                key_map=key_map,
-                selected_keys=selected_keys,
-                header_lines=HEADER_LINES,
-                data_row_offset=DATA_ROW_OFFSET,
-            )
-            stdscr.refresh()
-            time.sleep(0.05)  # ~20 fps -- keeps key input responsive
+    def draw_header_fn(
+        stdscr: Any,
+        width: int,
+        is_paused: bool,
+        is_selecting: bool,
+        selected_count: int,
+        now_mono: float,
+    ) -> None:
+        _draw_header(
+            stdscr,
+            width,
+            cmd_display=cmd_display,
+            interval=interval,
+            store=store,
+            capture_file=capture_file_name,
+            is_paused=is_paused,
+            is_selecting=is_selecting,
+            selected_count=selected_count,
+            reconn=reconn,
+            now_mono=now_mono,
+        )
 
     try:
-        curses.wrapper(_run)
-    except KeyboardInterrupt:
-        pass
+        tui_result = _run_tui(
+            interval=interval,
+            supports_pause=True,
+            refresh_fn=refresh_fn,
+            draw_header_fn=draw_header_fn,
+        )
     finally:
         stop_event.set()
         proc_holder[0].terminate()
@@ -2235,33 +2242,7 @@ def _watch_mode(args: argparse.Namespace) -> None:
         if capture_fh:
             capture_fh.close()
 
-    # Print the last snapshot so the user is not left with a blank screen.
-    if final_content:
-        print()
-        for line in final_content:
-            print(line)
-
-    # Generate policies from selected flows (triggered by Enter in select mode).
-    if generate_flag and selected_keys_final:
-        policies = _build_policies_from_flow_keys(selected_keys_final)
-        sorted_policies = [(ns, app, rules) for (ns, app), rules in sorted(policies.items())]
-        n_pol = len(sorted_policies)
-        print(
-            f"\nGenerating {n_pol} {'policy' if n_pol == 1 else 'policies'} "
-            f"from {len(selected_keys_final)} selected flows...",
-            file=sys.stderr,
-        )
-        if args.dry_run:
-            _write_multi_doc_yaml(sorted_policies, sys.stdout)
-        else:
-            written = _write_policy_dir(sorted_policies, args.output_dir)
-            print(
-                f"Wrote {written} {'policy' if written == 1 else 'policies'} "
-                f"to {os.path.realpath(args.output_dir)}",
-                file=sys.stderr,
-            )
-
-    print("\nWatch mode stopped.", file=sys.stderr)
+    _handle_tui_result(tui_result, args, "Watch mode stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -2522,8 +2503,7 @@ Loki backend (query flows stored in Grafana Loki):
         default=None,
         metavar="DURATION",
         help="Max time window per Loki request, e.g. 5s, 30s, 1m "
-        "(default: auto-scaled to ~48 chunks when -n/--namespace filters are active, "
-        "min 5m; 5s otherwise)",
+        "(default: auto-scaled to ~48 chunks, min 5m)",
     )
     loki_group.add_argument(
         "--loki-timeout",
@@ -2567,7 +2547,7 @@ def main() -> None:
     # Interactive watch mode with TUI.
     if args.watch:
         if args.source == "loki":
-            _loki_watch_mode(args)
+            _loki_watch_mode(args, parser)
         else:
             _watch_mode(args)
         return
@@ -2586,15 +2566,13 @@ def main() -> None:
             parser.error("--loki-password requires --loki-user")
         since_sec = _parse_duration(args.since)
         until_sec = _parse_duration(args.until)
-        loki_query = _loki_enrich_query(args.loki_query, namespaces)
+        loki_query = _loki_enrich_query(args.loki_query, namespaces, verdicts)
         if args.loki_chunk:
             chunk_sec = _parse_duration(args.loki_chunk)
-        elif namespaces:
+        else:
             max_chunks = 48
             range_sec = since_sec - until_sec
             chunk_sec = max(300.0, range_sec / max_chunks)
-        else:
-            chunk_sec = 5.0
         print(
             f"Querying Loki at {args.loki_url} "
             f"(query={loki_query!r}, since={args.since}, until={args.until}) ...",
