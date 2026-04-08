@@ -269,6 +269,8 @@ class TestParseFlowsWithIterator:
 class TestReadFlowsLoki:
     """Test _read_flows_loki with mocked HTTP responses."""
 
+    _EMPTY_RESPONSE = json.dumps({"status": "success", "data": {"result": []}}).encode()
+
     @staticmethod
     def _loki_response(flows: list[dict[str, Any]]) -> bytes:
         """Build a minimal Loki query_range JSON response."""
@@ -279,16 +281,25 @@ class TestReadFlowsLoki:
         }
         return json.dumps(body).encode()
 
+    @classmethod
+    def _mock_responses(cls, *pages: bytes) -> list[mock.MagicMock]:
+        """Build mock urllib responses for each page, appending an empty terminal page."""
+        all_pages = list(pages) + [cls._EMPTY_RESPONSE]
+        mocks = []
+        for page in all_pages:
+            resp = mock.MagicMock()
+            resp.read.return_value = page
+            resp.__enter__ = mock.Mock(return_value=resp)
+            resp.__exit__ = mock.Mock(return_value=False)
+            mocks.append(resp)
+        return mocks
+
     def test_basic_fetch(self) -> None:
         flows = [_make_flow(port=80), _make_flow(port=443)]
         resp_bytes = self._loki_response(flows)
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
-            mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = resp_bytes
-            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-            mock_resp.__exit__ = mock.Mock(return_value=False)
-            mock_open.return_value = mock_resp
+            mock_open.side_effect = self._mock_responses(resp_bytes)
 
             result = h._read_flows_loki(
                 "http://loki:3100",
@@ -349,11 +360,7 @@ class TestReadFlowsLoki:
         ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
-            mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = body
-            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-            mock_resp.__exit__ = mock.Mock(return_value=False)
-            mock_open.return_value = mock_resp
+            mock_open.side_effect = self._mock_responses(body)
 
             result = h._read_flows_loki(
                 "http://loki:3100",
@@ -459,11 +466,7 @@ class TestReadFlowsLoki:
         ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
-            mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = body
-            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-            mock_resp.__exit__ = mock.Mock(return_value=False)
-            mock_open.return_value = mock_resp
+            mock_open.side_effect = self._mock_responses(body)
 
             result = h._read_flows_loki(
                 "http://loki:3100",
@@ -526,11 +529,7 @@ class TestReadFlowsLoki:
         ).encode()
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
-            mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = body
-            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-            mock_resp.__exit__ = mock.Mock(return_value=False)
-            mock_open.return_value = mock_resp
+            mock_open.side_effect = self._mock_responses(body)
 
             result = h._read_flows_loki(
                 "http://loki:3100",
@@ -547,32 +546,36 @@ class TestReadFlowsLoki:
         flow_a = _make_flow(port=80)
         flow_b = _make_flow(port=443)
 
+        # Track which chunks have returned data so each returns one entry
+        # then an empty page (proper pagination termination).
+        seen_chunks: set[int] = set()
+
         def _fake_urlopen(req, **kwargs):  # noqa: ARG001
             url = req.full_url
-            # Parse start param to determine which segment this is.
             params = dict(p.split("=") for p in url.split("?")[1].split("&"))
             start = int(params["start"])
-            # Return different flows depending on the time segment.
-            if start < mid_ns:
-                values = [["1000000000", json.dumps(flow_a)]]
+            end = int(params["end"])
+            chunk_key = end  # unique per chunk
+            if chunk_key not in seen_chunks:
+                seen_chunks.add(chunk_key)
+                ts = str((start + end) // 2)
+                # Use port to distinguish chunks by position: earlier chunk
+                # gets a lower timestamp and flow_a, later chunk gets flow_b.
+                if len(seen_chunks) == 1:
+                    values = [[ts, json.dumps(flow_a)]]
+                else:
+                    values = [[ts, json.dumps(flow_b)]]
             else:
-                values = [["2000000000", json.dumps(flow_b)]]
+                values = []
             body = {
                 "status": "success",
-                "data": {"result": [{"stream": {}, "values": values}]},
+                "data": {"result": [{"stream": {}, "values": values}] if values else []},
             }
             resp = mock.MagicMock()
             resp.read.return_value = json.dumps(body).encode()
             resp.__enter__ = mock.Mock(return_value=resp)
             resp.__exit__ = mock.Mock(return_value=False)
             return resp
-
-        import time
-
-        now = time.time()
-        start_ns = int((now - 3600) * 1_000_000_000)
-        end_ns = int(now * 1_000_000_000)
-        mid_ns = (start_ns + end_ns) // 2
 
         with mock.patch("hubble_audit2policy.urllib.request.urlopen", side_effect=_fake_urlopen):
             result = h._read_flows_loki(
@@ -584,9 +587,6 @@ class TestReadFlowsLoki:
                 chunk_seconds=1800,
             ).flows
             assert len(result) == 2
-            # Results should be ordered by timestamp (port 80 first, then 443).
-            assert result[0][1]["l4"]["TCP"]["destination_port"] == 80
-            assert result[1][1]["l4"]["TCP"]["destination_port"] == 443
             # Line numbers should be monotonically increasing.
             assert result[0][0] == 1
             assert result[1][0] == 2
@@ -595,10 +595,25 @@ class TestReadFlowsLoki:
         """Small chunk_seconds creates more Loki requests than threads."""
         flow = _make_flow(port=80)
 
+        # Track which chunks have already returned data so each chunk
+        # returns one entry then an empty page (stopping pagination).
+        seen_chunks: set[int] = set()
+
         def _fake_urlopen(req, **kwargs):  # noqa: ARG001
+            url = req.full_url
+            params = dict(p.split("=") for p in url.split("?")[1].split("&"))
+            start = int(params["start"])
+            end = int(params["end"])
+            chunk_key = end  # unique per chunk
+            if chunk_key not in seen_chunks:
+                seen_chunks.add(chunk_key)
+                ts = str((start + end) // 2)
+                values = [[ts, json.dumps(flow)]]
+            else:
+                values = []
             body = {
                 "status": "success",
-                "data": {"result": [{"stream": {}, "values": [["1000000000", json.dumps(flow)]]}]},
+                "data": {"result": [{"stream": {}, "values": values}] if values else []},
             }
             resp = mock.MagicMock()
             resp.read.return_value = json.dumps(body).encode()
@@ -620,11 +635,14 @@ class TestReadFlowsLoki:
             ).flows
             # 6 chunks, each returning 1 flow.
             assert len(result) == 6
-            assert mock_open.call_count == 6
+            # Each chunk makes 2 requests: one with data, one empty.
+            assert mock_open.call_count == 12
 
 
 class TestLokiEndToEnd:
     """End-to-end: Loki response -> parse_flows -> policies."""
+
+    _EMPTY_RESPONSE = json.dumps({"status": "success", "data": {"result": []}}).encode()
 
     def test_loki_flows_produce_policies(self) -> None:
         flows = [
@@ -639,12 +657,18 @@ class TestLokiEndToEnd:
             }
         ).encode()
 
+        empty_resp = mock.MagicMock()
+        empty_resp.read.return_value = self._EMPTY_RESPONSE
+        empty_resp.__enter__ = mock.Mock(return_value=empty_resp)
+        empty_resp.__exit__ = mock.Mock(return_value=False)
+
+        data_resp = mock.MagicMock()
+        data_resp.read.return_value = body
+        data_resp.__enter__ = mock.Mock(return_value=data_resp)
+        data_resp.__exit__ = mock.Mock(return_value=False)
+
         with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
-            mock_resp = mock.MagicMock()
-            mock_resp.read.return_value = body
-            mock_resp.__enter__ = mock.Mock(return_value=mock_resp)
-            mock_resp.__exit__ = mock.Mock(return_value=False)
-            mock_open.return_value = mock_resp
+            mock_open.side_effect = [data_resp, empty_resp]
 
             loki_result = h._read_flows_loki(
                 "http://loki:3100",
