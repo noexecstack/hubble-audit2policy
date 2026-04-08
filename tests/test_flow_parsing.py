@@ -269,9 +269,7 @@ class TestParseFlowsWithIterator:
 class TestReadFlowsLoki:
     """Test _read_flows_loki with mocked HTTP responses."""
 
-    _EMPTY_RESPONSE = json.dumps(
-        {"status": "success", "data": {"result": []}}
-    ).encode()
+    _EMPTY_RESPONSE = json.dumps({"status": "success", "data": {"result": []}}).encode()
 
     @staticmethod
     def _loki_response(flows: list[dict[str, Any]]) -> bytes:
@@ -644,9 +642,7 @@ class TestReadFlowsLoki:
 class TestLokiEndToEnd:
     """End-to-end: Loki response -> parse_flows -> policies."""
 
-    _EMPTY_RESPONSE = json.dumps(
-        {"status": "success", "data": {"result": []}}
-    ).encode()
+    _EMPTY_RESPONSE = json.dumps({"status": "success", "data": {"result": []}}).encode()
 
     def test_loki_flows_produce_policies(self) -> None:
         flows = [
