@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -960,8 +960,8 @@ def _parse_flow_list(
     """Parse an in-memory list of flow dicts into per-workload rule sets.
 
     Mirrors ``parse_flows`` but takes a pre-loaded list instead of a file path.
-    Flows in the list must already be unwrapped (no ``{"flow": ...}`` envelope).
-    Used by live watch mode to re-derive a fresh snapshot on each refresh cycle.
+    Handles the ``{"flow": ...}`` envelope transparently, so callers may pass
+    either wrapped or unwrapped dicts.
     """
     policies: defaultdict[PolicyKey, RuleSet] = defaultdict(
         lambda: {"egress": set(), "ingress": set()}
@@ -1709,24 +1709,21 @@ def _draw_header(
             pass
 
 
-def _draw_loki_header(
+def _draw_report_header(
     stdscr: Any,
     width: int,
     *,
-    loki_url: str,
-    loki_query: str,
-    since: str,
-    until: str,
-    flow_count: int,
-    load_seconds: float,
+    source_label: str,
+    total: int,
+    matched: int,
+    unique: int,
     is_selecting: bool,
     selected_count: int,
-    partial: bool = False,
 ) -> None:
-    """Render the fixed header rows (0-2) for Loki watch mode TUI."""
+    """Render the fixed header rows (0-2) for the report-only interactive TUI."""
     # Row 0: source + timestamp
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-    left = f"Loki: {loki_url}  query={loki_query}"
+    left = f"Source: {source_label}"
     if len(left) > width - len(now_str) - 2:
         left = left[: width - len(now_str) - 5] + "..."
     padding = max(1, width - len(left) - len(now_str))
@@ -1735,17 +1732,10 @@ def _draw_loki_header(
     except curses.error:
         pass
 
-    # Row 1: time range + flow count + status badge
-    prefix = f"Range: since={since} until={until}  |  Flows: {flow_count}  "
-    if partial:
-        badge = f"* Partial results -- {load_seconds:.1f}s"
-        badge_attr = curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
-    else:
-        badge = f"* Loaded in {load_seconds:.1f}s"
-        badge_attr = curses.color_pair(1) if curses.has_colors() else curses.A_NORMAL
+    # Row 1: flow statistics
+    info = f"Total: {total}  |  Matched: {matched}  |  Unique connections: {unique}"
     try:
-        stdscr.addnstr(1, 0, prefix, width - 1)
-        stdscr.addnstr(1, len(prefix), badge, width - 1 - len(prefix), badge_attr)
+        stdscr.addnstr(1, 0, info, width - 1)
     except curses.error:
         pass
 
@@ -2019,92 +2009,25 @@ def _handle_tui_result(
     print(f"\n{exit_message}", file=sys.stderr)
 
 
-def _loki_watch_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    """Interactive TUI for Loki flows with workload selection.
+def _report_tui(
+    args: argparse.Namespace,
+    flow_counts: Counter[FlowKey],
+    total: int,
+    matched: int,
+    source_label: str,
+) -> None:
+    """Interactive TUI for browsing a pre-parsed flow report.
 
-    Fetches historical flows from a Loki instance, then presents the same
-    curses TUI as live watch mode so the user can browse, scroll, and
-    interactively select workloads to generate policies for.
+    Presents the same curses TUI as live watch mode so the user can browse,
+    scroll, and interactively select workloads to generate policies for.
 
-    Keys are the same as live watch mode (j/k scroll, s select, Space
-    toggle, Enter generate, q quit) except that pause/resume is not
-    applicable since flows are pre-loaded.
+    Keys: j/k scroll, s select mode, Space toggle selection, Enter generate,
+    q quit.  Data is static so pause/resume is not applicable.
     """
-    label_keys: list[str] = args.label_keys or DEFAULT_LABEL_KEYS
-    verdicts: set[str] = {v.upper() for v in args.verdict} if args.verdict else set()
-    namespaces: set[str] = set(args.namespaces or [])
-    interval: float = args.interval
-
-    # Validate Loki arguments.
-    if not args.loki_url:
-        parser.error("--loki-url is required when using --from loki")
-    if args.loki_token and args.loki_user:
-        parser.error("--loki-token and --loki-user are mutually exclusive")
-    if args.loki_password and not args.loki_user:
-        parser.error("--loki-password requires --loki-user")
-
-    since_sec = _parse_duration(args.since)
-    until_sec = _parse_duration(args.until)
-    loki_query = _loki_enrich_query(args.loki_query, namespaces, verdicts)
-    if args.loki_chunk:
-        chunk_sec = _parse_duration(args.loki_chunk)
-    else:
-        max_chunks = 200
-        range_sec = since_sec - until_sec
-        chunk_sec = max(60.0, range_sec / max_chunks)
-
-    print(
-        f"Querying Loki at {args.loki_url} "
-        f"(query={loki_query!r}, since={args.since}, until={args.until}) ...",
-        file=sys.stderr,
-    )
-
-    t0 = time.monotonic()
-    result = _read_flows_loki(
-        args.loki_url,
-        loki_query,
-        since_sec,
-        until_sec,
-        args.loki_limit,
-        loki_user=args.loki_user,
-        loki_password=args.loki_password,
-        loki_token=args.loki_token,
-        loki_tls_ca=args.loki_tls_ca,
-        loki_org_id=args.loki_org_id,
-        threads=args.loki_threads,
-        chunk_seconds=chunk_sec,
-        timeout=args.loki_timeout,
-        retries=args.loki_retries,
-    )
-    load_elapsed = time.monotonic() - t0
-    partial = result.partial
-    loki_flows = [flow for _, flow in result.flows]
-
-    if partial:
-        print(
-            f"Partial results -- continuing with {len(loki_flows)} flows "
-            f"fetched in {load_elapsed:.1f}s.",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            f"Loaded {len(loki_flows)} flows from Loki in {load_elapsed:.1f}s.",
-            file=sys.stderr,
-        )
-
-    if not loki_flows:
-        if partial:
-            print("No flows fetched before interrupt.", file=sys.stderr)
-        else:
-            LOG.warning("No flows returned from Loki query")
-        sys.exit(EXIT_NO_POLICIES)
-
     help_text = "\nj/k line  |  d/u half-page  |  g/G top/bottom  |  s select  |  q quit\n"
+    unique = len(flow_counts)
 
     def refresh_fn(width: int, _now_mono: float) -> tuple[list[FlowKey], list[str]]:
-        _, flow_counts, total, matched, _ = _parse_flow_list(
-            loki_flows, label_keys, verdicts, namespaces
-        )
         return _build_report_content(flow_counts, total, matched, width, help_text)
 
     def draw_header_fn(
@@ -2115,27 +2038,24 @@ def _loki_watch_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         selected_count: int,
         _now_mono: float,
     ) -> None:
-        _draw_loki_header(
+        _draw_report_header(
             stdscr,
             width,
-            loki_url=args.loki_url,
-            loki_query=args.loki_query,
-            since=args.since,
-            until=args.until,
-            flow_count=len(loki_flows),
-            load_seconds=load_elapsed,
+            source_label=source_label,
+            total=total,
+            matched=matched,
+            unique=unique,
             is_selecting=is_selecting,
-            partial=partial,
             selected_count=selected_count,
         )
 
     tui_result = _run_tui(
-        interval=interval,
+        interval=1.0,
         supports_pause=False,
         refresh_fn=refresh_fn,
         draw_header_fn=draw_header_fn,
     )
-    _handle_tui_result(tui_result, args, "Loki watch mode stopped.")
+    _handle_tui_result(tui_result, args, "Report closed.")
 
 
 def _watch_mode(args: argparse.Namespace) -> None:
@@ -2317,11 +2237,12 @@ Capture while watching, then generate policies:
   %(prog)s --watch --capture-file session.jsonl
   %(prog)s session.jsonl -o policies/
 
-Interactive flow selection (press s in watch mode):
+Interactive flow selection (press s in watch or report-only mode):
 
   %(prog)s --watch --output-dir policies/
   # inside TUI: s to select, j/k to move, Space to toggle, Enter to generate
   %(prog)s --watch --dry-run   # preview selected policies on stdout
+  %(prog)s cluster-flows.json --report-only --dry-run  # browse file, select, preview
 
 Loki backend (query flows stored in Grafana Loki):
 
@@ -2329,6 +2250,7 @@ Loki backend (query flows stored in Grafana Loki):
   %(prog)s --from loki --loki-url http://loki:3100 -n kube-system -o policies/
   %(prog)s --from loki --loki-url http://loki:3100 --since 2h --until 30m
   %(prog)s --from loki --loki-url http://loki:3100 --loki-query '{namespace="hubble"}'
+  %(prog)s --from loki --loki-url http://loki:3100 --report-only  # interactive TUI
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2338,7 +2260,8 @@ Loki backend (query flows stored in Grafana Loki):
         default=None,
         help=(
             "Path to Hubble flows file (JSONL or JSON array). "
-            "Required unless --watch is used (where it optionally seeds initial history)."
+            "Required unless --watch or --from loki is used. "
+            "With --watch it optionally seeds initial history."
         ),
     )
     parser.add_argument(
@@ -2390,18 +2313,22 @@ Loki backend (query flows stored in Grafana Loki):
     parser.add_argument(
         "--report-only",
         action="store_true",
-        help="Print the flow report and exit without generating policies",
+        help=(
+            "Browse the flow report interactively. On a terminal, launches "
+            "a TUI with scrolling and optional flow selection for policy "
+            "generation (press s to select, Enter to generate). "
+            "Without a terminal, prints a plain text report and exits."
+        ),
     )
     parser.add_argument(
         "-w",
         "--watch",
         action="store_true",
         help=(
-            "Interactive TUI mode with flow-frequency report, scrolling, "
-            "and workload selection for policy generation. "
-            "In live mode (default): spawns hubble observe and continuously "
-            "refreshes. With --from loki: fetches historical flows from "
-            "Loki and presents them in the same interactive TUI."
+            "Live monitoring mode: spawns hubble observe and continuously "
+            "refreshes an interactive TUI with flow-frequency report, "
+            "scrolling, and workload selection for policy generation. "
+            "Not compatible with --from loki (use --report-only instead)."
         ),
     )
     parser.add_argument(
@@ -2574,12 +2501,14 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.WARNING,
     )
 
-    # Interactive watch mode with TUI.
+    # Interactive watch mode with TUI (live hubble only).
     if args.watch:
         if args.source == "loki":
-            _loki_watch_mode(args, parser)
-        else:
-            _watch_mode(args)
+            parser.error(
+                "--watch is for live hubble monitoring; "
+                "use --report-only for interactive Loki browsing"
+            )
+        _watch_mode(args)
         return
 
     verdicts: set[str] = {v.upper() for v in args.verdict} if args.verdict else set()
@@ -2596,6 +2525,11 @@ def main() -> None:
             parser.error("--loki-password requires --loki-user")
         since_sec = _parse_duration(args.since)
         until_sec = _parse_duration(args.until)
+        if since_sec <= until_sec:
+            parser.error(
+                f"--since ({args.since}) must be greater than --until ({args.until}); "
+                f"--since is how far back, --until is the end of the window"
+            )
         loki_query = _loki_enrich_query(args.loki_query, namespaces, verdicts)
         if args.loki_chunk:
             chunk_sec = _parse_duration(args.loki_chunk)
@@ -2647,15 +2581,26 @@ def main() -> None:
     unknown_keys = _find_unknown_flows(flow_counts)
     has_unknowns = len(unknown_keys) > 0
 
+    # --- Report-only: interactive TUI on a terminal, plain text otherwise ---
+    if args.report_only:
+        if sys.stderr.isatty():
+            if args.source == "loki":
+                source_label = f"{args.loki_url} (since={args.since}, until={args.until})"
+            else:
+                source_label = args.flows_file or "stdin"
+            _report_tui(args, flow_counts, total, matched, source_label)
+        else:
+            _print_report(flow_counts, total, matched)
+            if has_unknowns:
+                _print_unknown_warnings(unknown_keys, flow_counts)
+        sys.exit(EXIT_OK)
+
     # --- Report modes (forced when unknowns exist) ---
-    if args.report or args.report_only or has_unknowns:
+    if args.report or has_unknowns:
         _print_report(flow_counts, total, matched)
 
     if has_unknowns:
         _print_unknown_warnings(unknown_keys, flow_counts)
-
-    if args.report_only:
-        sys.exit(EXIT_OK)
 
     if not policies:
         LOG.warning("No policies generated (parsed %d flows, %d matched)", total, matched)
