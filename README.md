@@ -248,8 +248,8 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `--loki-token TOKEN` | Bearer token for Loki (`Authorization: Bearer ...`) header |
 | `--loki-tls-ca PATH` | Path to a PEM CA certificate for verifying the Loki server (self-signed certs) |
 | `--loki-org-id ORG_ID` | Tenant ID sent as `X-Scope-OrgID` header (required when Loki `auth_enabled=true`) |
-| `--loki-threads N` | Number of parallel worker threads for Loki queries (default: `8`) |
-| `--loki-chunk DURATION` | Max time window per Loki request, e.g. `5s`, `30s`, `1m` (default: `5m` with `-n`, `5s` otherwise) |
+| `--loki-threads N` | Number of parallel worker threads for Loki queries (default: `4`) |
+| `--loki-chunk DURATION` | Max time window per Loki request, e.g. `5s`, `30s`, `1m` (default: auto-scaled to ~200 chunks, min `1m`) |
 | `--loki-timeout SECONDS` | HTTP request timeout in seconds for each Loki request (default: `30`) |
 | `-v, --verbose` | Enable verbose logging |
 | `-V, --version` | Show version and exit |

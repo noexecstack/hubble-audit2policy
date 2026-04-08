@@ -244,8 +244,8 @@ def _security_labels_to_match_labels(security_labels: list[str]) -> dict[str, st
     """Convert Cilium ``security-relevant`` labels to ``matchLabels`` entries.
 
     Excluded:
-    * ``k8s:io.cilium.k8s.namespace.labels.*`` – derived from Namespace labels
-    * ``k8s:io.cilium.k8s.policy.cluster=*``   – cluster-scoped, redundant
+    * ``k8s:io.cilium.k8s.namespace.labels.*`` - derived from Namespace labels
+    * ``k8s:io.cilium.k8s.policy.cluster=*``   - cluster-scoped, redundant
 
     The ``k8s:`` source prefix is stripped; Cilium adds it back automatically
     when evaluating ``matchLabels`` on Kubernetes endpoints.
@@ -581,6 +581,10 @@ def _loki_fetch_chunk(
     """
     entries: list[tuple[int, dict[str, Any]]] = []
     stats = _ChunkStats()
+    # Track line hashes at the pagination boundary timestamp so we can
+    # re-query with start=last_ts (inclusive) and skip duplicates.  Using
+    # last_ts+1 silently drops entries that share the boundary timestamp.
+    boundary_hashes: set[int] = set()
     while True:
         params = urllib.parse.urlencode(
             {
@@ -633,26 +637,52 @@ def _loki_fetch_chunk(
 
         streams = body.get("data", {}).get("result", [])
         batch_count = 0
-        last_ts: int | None = None
+        max_ts: int | None = None
+        # Collect line hashes per timestamp for boundary dedup.
+        ts_line_hashes: dict[int, set[int]] = {}
 
         for stream in streams:
             for ts_str, line in stream.get("values", []):
                 batch_count += 1
-                last_ts = int(ts_str)
+                ts = int(ts_str)
+                if max_ts is None or ts > max_ts:
+                    max_ts = ts
                 line = line.strip()
                 if not line:
                     continue
+                line_h = hash(line)
+                # Skip duplicates carried over from the previous page boundary.
+                if boundary_hashes and ts == start_ns and line_h in boundary_hashes:
+                    boundary_hashes.discard(line_h)
+                    continue
+                ts_line_hashes.setdefault(ts, set()).add(line_h)
                 try:
-                    entries.append((last_ts, json.loads(line)))
+                    entries.append((ts, json.loads(line)))
                 except json.JSONDecodeError:
                     pass  # Non-JSON lines (e.g. cilium agent logs) are expected.
 
-        if batch_count < limit:
+        # Loki can return fewer entries than `limit` even when more data
+        # exists (storage block boundaries, ingester splits, etc.).  The
+        # official logcli client stops only on an *empty* response, not a
+        # short one.  We do the same, with a safety check that the cursor
+        # actually advances to avoid infinite loops.
+        if batch_count == 0:
             break
 
-        if last_ts is not None:
-            start_ns = last_ts + 1
+        if max_ts is not None:
+            if max_ts > start_ns:
+                # Normal case: cursor advances to the latest timestamp seen.
+                boundary_hashes = ts_line_hashes.get(max_ts, set())
+                start_ns = max_ts
+            else:
+                # Cursor can't advance (all entries at or before start_ns).
+                # Step forward by 1 ns to avoid an infinite loop.
+                start_ns = max_ts + 1
+                boundary_hashes = set()
         else:
+            break
+
+        if start_ns >= end_ns:
             break
 
     return entries, stats
@@ -670,7 +700,7 @@ def _read_flows_loki(
     loki_token: str | None = None,
     loki_tls_ca: str | None = None,
     loki_org_id: str | None = None,
-    threads: int = 8,
+    threads: int = 4,
     chunk_seconds: float = 5,
     timeout: int = 30,
     retries: int = 3,
@@ -694,7 +724,7 @@ def _read_flows_loki(
     *loki_tls_ca* points to a PEM CA certificate for TLS verification.
     *loki_org_id* sets the ``X-Scope-OrgID`` header for multi-tenant Loki.
 
-    *threads* controls the parallel worker count (default: 8).
+    *threads* controls the parallel worker count (default: 4).
     *chunk_seconds* sets the max time window per request (default: 5);
     smaller chunks reduce per-request load and are less likely to time
     out.  *timeout* is the HTTP timeout per request (default: 30).
@@ -2019,9 +2049,9 @@ def _loki_watch_mode(args: argparse.Namespace, parser: argparse.ArgumentParser) 
     if args.loki_chunk:
         chunk_sec = _parse_duration(args.loki_chunk)
     else:
-        max_chunks = 48
+        max_chunks = 200
         range_sec = since_sec - until_sec
-        chunk_sec = max(300.0, range_sec / max_chunks)
+        chunk_sec = max(60.0, range_sec / max_chunks)
 
     print(
         f"Querying Loki at {args.loki_url} "
@@ -2494,16 +2524,16 @@ Loki backend (query flows stored in Grafana Loki):
     loki_group.add_argument(
         "--loki-threads",
         type=int,
-        default=8,
+        default=4,
         metavar="N",
-        help="Number of parallel worker threads for Loki queries (default: 8)",
+        help="Number of parallel worker threads for Loki queries (default: 4)",
     )
     loki_group.add_argument(
         "--loki-chunk",
         default=None,
         metavar="DURATION",
         help="Max time window per Loki request, e.g. 5s, 30s, 1m "
-        "(default: auto-scaled to ~48 chunks, min 5m)",
+        "(default: auto-scaled to ~200 chunks, min 1m)",
     )
     loki_group.add_argument(
         "--loki-timeout",
@@ -2570,9 +2600,9 @@ def main() -> None:
         if args.loki_chunk:
             chunk_sec = _parse_duration(args.loki_chunk)
         else:
-            max_chunks = 48
+            max_chunks = 200
             range_sec = since_sec - until_sec
-            chunk_sec = max(300.0, range_sec / max_chunks)
+            chunk_sec = max(60.0, range_sec / max_chunks)
         print(
             f"Querying Loki at {args.loki_url} "
             f"(query={loki_query!r}, since={args.since}, until={args.until}) ...",
