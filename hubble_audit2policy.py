@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.14.2"
+__version__ = "0.15.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
