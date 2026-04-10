@@ -971,6 +971,15 @@ class TestLokiAuth:
             ' |~ "namespace.{0,5}:.{0,5}argocd"'
         )
 
+    def test_enrich_query_hyphenated_namespace(self) -> None:
+        """Hyphens in namespace names must not be backslash-escaped."""
+        q = '{app="cilium-agent"}'
+        result = h._loki_enrich_query(q, ["kube-system"])
+        assert result == (
+            '{app="cilium-agent"} |~ "verdict.{0,5}:" |~ "namespace.{0,5}:.{0,5}kube-system"'
+        )
+        assert "kube\\-system" not in result
+
     def test_enrich_query_filters_match_promtail_format(self) -> None:
         """Verify generated regex matches promtail-style log text."""
         import re

@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.17.0"
+__version__ = "0.17.1"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -462,11 +462,16 @@ def _loki_enrich_query(
     """
     # Verdict filter -- push as specific a match as possible so Loki
     # discards non-matching lines before sending them to us.
+    # Verdict/namespace values are Kubernetes DNS labels ([a-z0-9-]) or
+    # uppercase verdict names (AUDIT, DROPPED, ...) -- none contain regex
+    # metacharacters, so no escaping is needed.  Using re.escape() would
+    # inject Python-style backslashes (e.g. kube\-system) that are invalid
+    # in LogQL's Go-style string literals.
     verdict_list = sorted(set(verdicts))
     if len(verdict_list) == 1:
-        query += ' |~ "verdict.{0,5}:.{0,5}' + re.escape(verdict_list[0]) + '"'
+        query += ' |~ "verdict.{0,5}:.{0,5}' + verdict_list[0] + '"'
     elif len(verdict_list) > 1:
-        vpat = "|".join(re.escape(v) for v in verdict_list)
+        vpat = "|".join(verdict_list)
         query += ' |~ "verdict.{0,5}:.{0,5}(' + vpat + ')"'
     else:
         # No specific verdict -- still filter to flow records only.
@@ -476,8 +481,8 @@ def _loki_enrich_query(
     if not ns_list:
         return query
     if len(ns_list) == 1:
-        return query + ' |~ "namespace.{0,5}:.{0,5}' + re.escape(ns_list[0]) + '"'
-    pattern = "|".join(re.escape(ns) for ns in ns_list)
+        return query + ' |~ "namespace.{0,5}:.{0,5}' + ns_list[0] + '"'
+    pattern = "|".join(ns_list)
     return query + ' |~ "namespace.{0,5}:.{0,5}(' + pattern + ')"'
 
 
