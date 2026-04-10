@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-04-10
+
+### Added
+
+- fluent-bit support: Loki log lines wrapped in a `{"log": "..."}` JSON envelope are now automatically detected and unwrapped, so flows ingested via fluent-bit work out of the box alongside promtail.
+- Default `--loki-query` changed from `{container="cilium-agent"}` (promtail) to `{app_kubernetes_io_name="cilium-agent"}` (fluent-bit). Promtail users can override with `--loki-query '{container="cilium-agent"}'`.
+
+### Fixed
+
+- Loki server-side line filters now use format-agnostic regex patterns (`verdict.{0,5}:.{0,5}AUDIT`) instead of literal JSON patterns (`"verdict":"AUDIT"`), so they match both promtail (plain quotes) and fluent-bit (escaped quotes) log formats.
+
 ## [0.13.0] - 2026-04-02
 
 ### Added
