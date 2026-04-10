@@ -88,10 +88,10 @@ hubble-audit2policy flows.json --report-only
 
 Query a Grafana Loki instance directly -- ideal when Hubble flows are already being shipped to Loki via fluentd, promtail, or another collector.
 
-The default LogQL selector is `{container="cilium-agent"}`, which matches the standard Cilium agent container label. Override it with `--loki-query` if your setup uses different labels.
+The default LogQL selector is `{app_kubernetes_io_name="cilium-agent"}`, which matches the standard fluent-bit Kubernetes label for the Cilium agent. For promtail setups use `--loki-query '{container="cilium-agent"}'`. Override with `--loki-query` if your setup uses different labels.
 
 ```bash
-# All flows from the last hour (uses default query {container="cilium-agent"}):
+# All flows from the last hour (uses default query {app_kubernetes_io_name="cilium-agent"}):
 hubble-audit2policy --from loki --loki-url http://loki:3100 --dry-run
 
 # Scoped to a namespace with a custom time window:
@@ -239,7 +239,7 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 | `--no-enrich` | Skip live cluster enrichment via Cilium endpoints |
 | `--from {file,loki}` | Flow source backend (default: `file`) |
 | `--loki-url URL` | Loki base URL, e.g. `http://loki:3100` |
-| `--loki-query LOGQL` | LogQL stream selector (default: `{container="cilium-agent"}`) |
+| `--loki-query LOGQL` | LogQL stream selector (default: `{app_kubernetes_io_name="cilium-agent"}`; for promtail: `{container="cilium-agent"}`) |
 | `--since DURATION` | How far back to query, e.g. `30m`, `2h`, `1d` (default: `1h`) |
 | `--until DURATION` | End of query window as duration before now (default: `0s` = now) |
 | `--loki-limit N` | Max entries per Loki request batch (default: `5000`) |

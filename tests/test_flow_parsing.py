@@ -690,6 +690,119 @@ class TestLokiEndToEnd:
             assert "db" in apps
 
 
+class TestExtractFlowFromLokiLine:
+    """Tests for _extract_flow_from_loki_line (promtail vs fluent-bit)."""
+
+    def test_raw_flow_dict(self) -> None:
+        """promtail-style: the parsed line IS the flow dict."""
+        flow = _make_flow(port=80)
+        assert h._extract_flow_from_loki_line(flow) is flow
+
+    def test_flow_envelope(self) -> None:
+        """promtail-style with a {flow: ...} wrapper."""
+        inner = _make_flow(port=443)
+        # parse_flows handles the {"flow": ...} unwrap; _extract_flow_from_loki_line
+        # just returns the outer dict.
+        envelope = {"flow": inner, "time": "2026-01-01T00:00:00Z"}
+        result = h._extract_flow_from_loki_line(envelope)
+        assert result is envelope
+
+    def test_fluentbit_envelope(self) -> None:
+        """fluent-bit-style: flow JSON is escaped inside a 'log' string."""
+        inner = _make_flow(port=8080)
+        log_value = "2026-04-10T09:08:39.418Z stdout F " + json.dumps(inner)
+        line = {"log": log_value, "kubernetes": {"namespace_name": "kube-system"}}
+        result = h._extract_flow_from_loki_line(line)
+        assert result is not None
+        assert result["l4"]["TCP"]["destination_port"] == 8080
+        assert result["verdict"] == "AUDIT"
+
+    def test_fluentbit_envelope_with_flow_wrapper(self) -> None:
+        """fluent-bit log value contains {flow: {<actual flow>}}."""
+        inner = _make_flow(port=9090)
+        wrapper = {"flow": inner, "time": "2026-04-10T09:00:00Z"}
+        log_value = "2026-04-10T09:00:00.000Z stdout F " + json.dumps(wrapper)
+        line = {"log": log_value, "kubernetes": {}}
+        result = h._extract_flow_from_loki_line(line)
+        assert result is not None
+        assert result["flow"]["l4"]["TCP"]["destination_port"] == 9090
+
+    def test_fluentbit_non_json_log(self) -> None:
+        """fluent-bit line whose 'log' is not parseable JSON returns None."""
+        line = {"log": "2026-04-10T09:00:00Z stdout F level=info msg=starting"}
+        assert h._extract_flow_from_loki_line(line) is None
+
+    def test_fluentbit_log_not_dict(self) -> None:
+        """fluent-bit line whose inner JSON is a list returns None."""
+        line = {"log": "2026-04-10T09:00:00Z stdout F [1, 2, 3]"}
+        assert h._extract_flow_from_loki_line(line) is None
+
+    def test_non_dict_input(self) -> None:
+        assert h._extract_flow_from_loki_line("not a dict") is None
+        assert h._extract_flow_from_loki_line(42) is None
+        assert h._extract_flow_from_loki_line(None) is None
+
+
+class TestFluentBitLokiEndToEnd:
+    """End-to-end: fluent-bit Loki response -> parse_flows -> policies."""
+
+    _EMPTY_RESPONSE = json.dumps({"status": "success", "data": {"result": []}}).encode()
+
+    @staticmethod
+    def _fluentbit_loki_response(flows: list[dict[str, Any]]) -> bytes:
+        """Build a Loki response where each line is a fluent-bit envelope."""
+        values = []
+        for i, flow in enumerate(flows, 1):
+            ts = str(i * 1_000_000_000)
+            log_text = f"2026-04-10T09:08:{i:02d}.000Z stdout F " + json.dumps(flow)
+            envelope = {"log": log_text, "kubernetes": {"namespace_name": "kube-system"}}
+            values.append([ts, json.dumps(envelope)])
+        body = {
+            "status": "success",
+            "data": {"result": [{"stream": {}, "values": values}]},
+        }
+        return json.dumps(body).encode()
+
+    def test_fluentbit_flows_produce_policies(self) -> None:
+        flows = [
+            _make_flow(src_app="web", dst_app="api", port=8080),
+            _make_flow(src_app="api", dst_app="db", port=5432),
+        ]
+        resp_bytes = self._fluentbit_loki_response(flows)
+
+        empty_resp = mock.MagicMock()
+        empty_resp.read.return_value = self._EMPTY_RESPONSE
+        empty_resp.__enter__ = mock.Mock(return_value=empty_resp)
+        empty_resp.__exit__ = mock.Mock(return_value=False)
+
+        data_resp = mock.MagicMock()
+        data_resp.read.return_value = resp_bytes
+        data_resp.__enter__ = mock.Mock(return_value=data_resp)
+        data_resp.__exit__ = mock.Mock(return_value=False)
+
+        with mock.patch("hubble_audit2policy.urllib.request.urlopen") as mock_open:
+            mock_open.side_effect = [data_resp, empty_resp]
+
+            loki_result = h._read_flows_loki(
+                "http://loki:3100",
+                '{app="hubble"}',
+                3600,
+                0,
+                threads=1,
+                chunk_seconds=7200,
+            )
+            assert len(loki_result.flows) == 2
+            policies, _, total, matched, _ = h.parse_flows(
+                "", LABEL_KEYS, set(), set(), flow_iter=iter(loki_result.flows)
+            )
+            assert total == 2
+            assert matched == 2
+            apps = {app for _, app in policies}
+            assert "web" in apps
+            assert "api" in apps
+            assert "db" in apps
+
+
 class TestLokiAuth:
     """Test Loki authentication modes in _read_flows_loki."""
 
@@ -809,7 +922,7 @@ class TestLokiAuth:
 
     def test_enrich_query_no_namespaces(self) -> None:
         q = '{container="cilium-agent"}'
-        verdict = r' |= "\"verdict\":"'
+        verdict = ' |~ "verdict.{0,5}:"'
         assert h._loki_enrich_query(q, []) == q + verdict
         assert h._loki_enrich_query(q, set()) == q + verdict
 
@@ -817,48 +930,76 @@ class TestLokiAuth:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, ["argocd"])
         assert result == (
-            r'{container="cilium-agent"} |= "\"verdict\":"'
-            r' |= "\"namespace\":\"argocd\""'
+            '{container="cilium-agent"} |~ "verdict.{0,5}:" |~ "namespace.{0,5}:.{0,5}argocd"'
         )
 
     def test_enrich_query_multiple_namespaces(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, ["monitoring", "argocd"])
         assert result == (
-            r'{container="cilium-agent"} |= "\"verdict\":"'
-            r' |~ "\"namespace\":\"(argocd|monitoring)\""'
+            '{container="cilium-agent"} |~ "verdict.{0,5}:"'
+            ' |~ "namespace.{0,5}:.{0,5}(argocd|monitoring)"'
         )
 
     def test_enrich_query_deduplicates(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, ["argocd", "argocd"])
         assert result == (
-            r'{container="cilium-agent"} |= "\"verdict\":"'
-            r' |= "\"namespace\":\"argocd\""'
+            '{container="cilium-agent"} |~ "verdict.{0,5}:" |~ "namespace.{0,5}:.{0,5}argocd"'
         )
 
     def test_enrich_query_single_verdict(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, [], verdicts=["AUDIT"])
-        assert result == (r'{container="cilium-agent"} |= "\"verdict\":\"AUDIT\""')
+        assert result == '{container="cilium-agent"} |~ "verdict.{0,5}:.{0,5}AUDIT"'
 
     def test_enrich_query_multiple_verdicts(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, [], verdicts=["DROPPED", "AUDIT"])
-        assert result == (r'{container="cilium-agent"} |~ "\"verdict\":\"(AUDIT|DROPPED)\""')
+        assert result == ('{container="cilium-agent"} |~ "verdict.{0,5}:.{0,5}(AUDIT|DROPPED)"')
 
     def test_enrich_query_verdict_deduplicates(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, [], verdicts=["AUDIT", "AUDIT"])
-        assert result == (r'{container="cilium-agent"} |= "\"verdict\":\"AUDIT\""')
+        assert result == '{container="cilium-agent"} |~ "verdict.{0,5}:.{0,5}AUDIT"'
 
     def test_enrich_query_verdict_and_namespace(self) -> None:
         q = '{container="cilium-agent"}'
         result = h._loki_enrich_query(q, ["argocd"], verdicts=["AUDIT"])
         assert result == (
-            r'{container="cilium-agent"} |= "\"verdict\":\"AUDIT\""'
-            r' |= "\"namespace\":\"argocd\""'
+            '{container="cilium-agent"} |~ "verdict.{0,5}:.{0,5}AUDIT"'
+            ' |~ "namespace.{0,5}:.{0,5}argocd"'
         )
+
+    def test_enrich_query_filters_match_promtail_format(self) -> None:
+        """Verify generated regex matches promtail-style log text."""
+        import re
+
+        q = '{app="cilium-agent"}'
+        result = h._loki_enrich_query(q, ["loki"], verdicts=["AUDIT"])
+        # Extract the two regex patterns from the LogQL filters.
+        patterns = re.findall(r'\|~ "([^"]+)"', result)
+        assert len(patterns) == 2
+        # promtail text has plain JSON: "verdict":"AUDIT"  "namespace":"loki"
+        promtail_line = '{"verdict":"AUDIT","source":{"namespace":"loki"}}'
+        for pat in patterns:
+            assert re.search(pat, promtail_line), f"pattern {pat!r} should match promtail"
+
+    def test_enrich_query_filters_match_fluentbit_format(self) -> None:
+        """Verify generated regex matches fluent-bit-style log text."""
+        import re
+
+        q = '{app="cilium-agent"}'
+        result = h._loki_enrich_query(q, ["loki"], verdicts=["AUDIT"])
+        patterns = re.findall(r'\|~ "([^"]+)"', result)
+        assert len(patterns) == 2
+        # fluent-bit text has escaped JSON inside a "log" wrapper:
+        fluentbit_line = (
+            r'{"log":"2026-04-10T09:08:39Z stdout F '
+            r'{\"verdict\":\"AUDIT\",\"source\":{\"namespace\":\"loki\"}}"}'
+        )
+        for pat in patterns:
+            assert re.search(pat, fluentbit_line), f"pattern {pat!r} should match fluent-bit"
 
     def test_build_loki_ssl_context_none(self) -> None:
         assert h._build_loki_ssl_context(None) is None

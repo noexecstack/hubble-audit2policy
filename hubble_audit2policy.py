@@ -8,7 +8,7 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 __author__ = "noexecstack"
 __license__ = "Apache-2.0"
 
@@ -453,26 +453,32 @@ def _loki_enrich_query(
     filters lines server-side.
 
     Multiple namespaces/verdicts are OR-joined into a single regex filter.
+
+    The regex patterns use ``.{0,5}`` gaps between JSON keys, colons, and
+    values so they match both promtail-style lines (where the log text
+    contains ``"verdict":"AUDIT"``) and fluent-bit-style lines (where the
+    flow JSON is escaped inside a wrapper object, producing
+    ``\"verdict\":\"AUDIT\"``).
     """
     # Verdict filter -- push as specific a match as possible so Loki
     # discards non-matching lines before sending them to us.
     verdict_list = sorted(set(verdicts))
     if len(verdict_list) == 1:
-        query += r' |= "\"verdict\":\"' + verdict_list[0] + r'\""'
+        query += ' |~ "verdict.{0,5}:.{0,5}' + re.escape(verdict_list[0]) + '"'
     elif len(verdict_list) > 1:
         vpat = "|".join(re.escape(v) for v in verdict_list)
-        query += r' |~ "\"verdict\":\"(' + vpat + r')\""'
+        query += ' |~ "verdict.{0,5}:.{0,5}(' + vpat + ')"'
     else:
         # No specific verdict -- still filter to flow records only.
-        query += r' |= "\"verdict\":"'
+        query += ' |~ "verdict.{0,5}:"'
 
     ns_list = sorted(set(namespaces))
     if not ns_list:
         return query
     if len(ns_list) == 1:
-        return query + r' |= "\"namespace\":\"' + ns_list[0] + r'\""'
+        return query + ' |~ "namespace.{0,5}:.{0,5}' + re.escape(ns_list[0]) + '"'
     pattern = "|".join(re.escape(ns) for ns in ns_list)
-    return query + r' |~ "\"namespace\":\"(' + pattern + r')\""'
+    return query + ' |~ "namespace.{0,5}:.{0,5}(' + pattern + ')"'
 
 
 class _LokiProgress:
@@ -556,6 +562,40 @@ class _ChunkStats:
 
     retries: int = 0
     failed: bool = False
+
+
+_FLUENT_BIT_LOG_PREFIX = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+\S+\s+\S+\s+"
+)
+
+
+def _extract_flow_from_loki_line(parsed: Any) -> dict[str, Any] | None:
+    """Return a Hubble flow dict from a parsed Loki log line.
+
+    Handles two formats:
+
+    * **Raw / promtail**: the log line is the Hubble JSON directly, e.g.
+      ``{"flow": {...}, ...}`` or ``{"time": ..., "verdict": ...}``.
+    * **fluent-bit envelope**: the log line is a JSON object with a ``"log"``
+      key whose value is the original container stdout, e.g.
+      ``{"log": "2026-... stdout F {\"flow\":{...}}", "kubernetes": {...}}``.
+      The inner text is stripped of the timestamp/stream prefix and then
+      parsed as JSON.
+
+    Returns ``None`` if no flow can be extracted.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    # fluent-bit format: outer envelope with a "log" string field.
+    if "log" in parsed and isinstance(parsed["log"], str):
+        inner = _FLUENT_BIT_LOG_PREFIX.sub("", parsed["log"], count=1).strip()
+        try:
+            parsed = json.loads(inner)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+    return cast("dict[str, Any]", parsed)
 
 
 def _loki_fetch_chunk(
@@ -657,7 +697,10 @@ def _loki_fetch_chunk(
                     continue
                 ts_line_hashes.setdefault(ts, set()).add(line_h)
                 try:
-                    entries.append((ts, json.loads(line)))
+                    parsed = json.loads(line)
+                    flow = _extract_flow_from_loki_line(parsed)
+                    if flow is not None:
+                        entries.append((ts, flow))
                 except json.JSONDecodeError:
                     pass  # Non-JSON lines (e.g. cilium agent logs) are expected.
 
@@ -2400,9 +2443,10 @@ Loki backend (query flows stored in Grafana Loki):
     )
     loki_group.add_argument(
         "--loki-query",
-        default='{container="cilium-agent"}',
+        default='{app_kubernetes_io_name="cilium-agent"}',
         metavar="LOGQL",
-        help='LogQL stream selector (default: {container="cilium-agent"})',
+        help='LogQL stream selector (default: {app_kubernetes_io_name="cilium-agent"})'
+        '; for promtail use {container="cilium-agent"}',
     )
     loki_group.add_argument(
         "--since",
