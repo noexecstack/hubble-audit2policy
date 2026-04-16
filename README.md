@@ -25,7 +25,13 @@ It also works with live Hubble streams and plain JSON files if that is what you 
 ## Installation
 
 ```bash
-pip install git+https://github.com/noexecstack/hubble-audit2policy.git
+pip install hubble-audit2policy
+```
+
+Or with [pipx](https://pipx.pypa.io/) for an isolated install:
+
+```bash
+pipx install hubble-audit2policy
 ```
 
 For development (includes pytest, ruff, mypy):
