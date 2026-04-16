@@ -2,6 +2,8 @@
 
 Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/) YAML from real observed traffic. No enterprise license required.
 
+![Flow report TUI showing observed connections from Loki](tui-flow-report.png)
+
 ## Why this exists
 
 Cilium OSS gives you Hubble for flow observability, but it has a hard limit: Hubble keeps only 5 minutes of flows in its ring buffer before they are gone. There is no built-in way to look back over hours or days of traffic and generate network policies from what actually happened. Cisco's/Isovalent's enterprise offering, Timescape, fills that gap, but it requires an enterprise license.
@@ -13,8 +15,6 @@ The key benefit is **capturing workload ground noise**: the full picture of what
 The typical workflow is to start from a zero-trust baseline (default-deny policies) and then use this tool filtered to audit verdicts only (`--verdict audit`) to see what traffic would be blocked. Those audit flows represent the gaps in your policy, the legitimate connections that need to be allowed. hubble-audit2policy turns them directly into the CiliumNetworkPolicy rules that fill those gaps.
 
 You get the same outcome as an enterprise policy-generation feature, using infrastructure you probably already run.
-
-![Flow report TUI showing observed connections from Loki](tui-flow-report.png)
 
 ## Recommended Cilium Helm values
 
