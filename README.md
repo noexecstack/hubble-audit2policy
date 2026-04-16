@@ -4,14 +4,6 @@ Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/
 
 ![Flow report TUI showing observed connections from Loki](https://raw.githubusercontent.com/noexecstack/hubble-audit2policy/main/tui-flow-report.png)
 
-Real world example querying 24h of ArgoCD flows from Loki:
-
-```bash
-hubble-audit2policy --from loki --loki-user admin --loki-password admin \
-  --loki-org-id default --since 24h -n argocd --report-only \
-  --loki-url http://loki-gateway.loki.svc.cluster.local:80
-```
-
 ## Why this exists
 
 Cilium OSS gives you Hubble for flow observability, but it has a hard limit: Hubble keeps only 5 minutes of flows in its ring buffer before they are gone. There is no built-in way to look back over hours or days of traffic and generate network policies from what actually happened. Cisco's/Isovalent's enterprise offering, Timescape, fills that gap, but it requires an enterprise license.
