@@ -8,8 +8,8 @@ derived from observed traffic.
 
 from __future__ import annotations
 
-__version__ = "0.18.3"
-__author__ = "noexecstack"
+__version__ = "0.18.4"
+__author__ = "Danny Burrow"
 __license__ = "Apache-2.0"
 
 import argparse

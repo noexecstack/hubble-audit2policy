@@ -4,20 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hubble-audit2policy"
-version = "0.18.3"
+version = "0.18.4"
 description = "Generate least-privilege CiliumNetworkPolicy YAML from Hubble flow logs."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-authors = [{ name = "noexecstack" }]
+authors = [{ name = "Danny Burrow" }]
 keywords = ["cilium", "hubble", "kubernetes", "network-policy", "security", "sre", "platform-engineering"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Environment :: Console :: Curses",
     "Intended Audience :: Developers",
-    "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
     "Topic :: System :: Networking :: Firewalls",
