@@ -7,7 +7,7 @@ Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/
 Real world example querying 24h of ArgoCD flows from Loki:
 
 ```bash
-hubble-audit2policy --from loki --loki-user admin --loki-password admin \
+hubble-audit2policy --from loki \
   --loki-org-id default --since 24h -n argocd --report-only \
   --loki-url http://loki-gateway.loki.svc.cluster.local:80
 ```
