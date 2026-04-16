@@ -1,6 +1,8 @@
 # hubble-audit2policy
 
-Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/) YAML from real observed traffic -- no enterprise license required.
+Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/) YAML from real observed traffic. No enterprise license required.
+
+![Flow report TUI showing observed connections from Loki](tui-flow-report.png)
 
 ## Why this exists
 
@@ -8,11 +10,21 @@ Cilium OSS gives you Hubble for flow observability, but it has a hard limit: Hub
 
 This tool takes a different approach. If you are already shipping Hubble flows to Grafana Loki (or any log pipeline), you have a long-term record of every connection your workloads make. hubble-audit2policy queries that record and turns it into per-workload CiliumNetworkPolicy files with proper ingress and egress rules, enriched with real Cilium endpoint labels.
 
-The key benefit is **capturing workload ground noise** -- the full picture of what your services actually talk to, including the traffic that only happens during UAT, development, cron jobs, nightly batches, cache warming, leader elections, or once-a-week reconciliation loops. With only a 5-minute ring buffer, you will never catch all of that by watching live. Loki keeps it all, and this tool reads it all back.
+The key benefit is **capturing workload ground noise**: the full picture of what your services actually talk to, including the traffic that only happens during UAT, development, cron jobs, nightly batches, cache warming, leader elections, or once-a-week reconciliation loops. With only a 5-minute ring buffer, you will never catch all of that by watching live. Loki keeps it all, and this tool reads it all back.
 
-The typical workflow is to start from a zero-trust baseline (default-deny policies) and then use this tool filtered to audit verdicts only (`--verdict audit`) to see what traffic would be blocked. Those audit flows represent the gaps in your policy -- the legitimate connections that need to be allowed. hubble-audit2policy turns them directly into the CiliumNetworkPolicy rules that fill those gaps.
+The typical workflow is to start from a zero-trust baseline (default-deny policies) and then use this tool filtered to audit verdicts only (`--verdict audit`) to see what traffic would be blocked. Those audit flows represent the gaps in your policy, the legitimate connections that need to be allowed. hubble-audit2policy turns them directly into the CiliumNetworkPolicy rules that fill those gaps.
 
 You get the same outcome as an enterprise policy-generation feature, using infrastructure you probably already run.
+
+## Recommended Cilium Helm values
+
+Not required, but `policyAuditMode` is how you get audit verdicts out of Cilium:
+
+```yaml
+policyAuditMode: true
+```
+
+With this on, Cilium logs traffic that _would_ be denied without actually dropping it. Those audit flows are what this tool uses to find the gaps in your policy coverage.
 
 ## How it works
 
@@ -46,7 +58,7 @@ pip install -e ".[dev]"
 
 ### From Loki (recommended)
 
-Query your existing log pipeline -- no port-forwarding, no time pressure, full history:
+Query your existing log pipeline. No port-forwarding, no time pressure, full history:
 
 ```bash
 hubble-audit2policy --from loki --loki-url http://loki:3100 -o policies/
@@ -92,7 +104,7 @@ hubble-audit2policy flows.json --report-only
 
 ## Loki Backend
 
-Query a Grafana Loki instance directly -- ideal when Hubble flows are already being shipped to Loki via fluentd, promtail, or another collector.
+Query a Grafana Loki instance directly. Useful if you already ship Hubble flows to Loki via fluentd, promtail, or another collector.
 
 The default LogQL selector is `{app_kubernetes_io_name="cilium-agent"}`, which matches the standard fluent-bit Kubernetes label for the Cilium agent. For promtail setups use `--loki-query '{container="cilium-agent"}'`. Override with `--loki-query` if your setup uses different labels.
 
@@ -119,7 +131,7 @@ hubble-audit2policy --from loki --loki-url https://loki.example.com --loki-token
 # HTTP Basic auth:
 hubble-audit2policy --from loki --loki-url https://loki.example.com --loki-user admin --loki-password secret
 
-# Multi-tenant Loki (auth_enabled=true) -- sends the X-Scope-OrgID header:
+# Multi-tenant Loki (auth_enabled=true), sends the X-Scope-OrgID header:
 hubble-audit2policy --from loki --loki-url http://loki:3100 --loki-org-id my-tenant
 
 # Self-signed TLS certificate:
@@ -191,8 +203,8 @@ hubble-audit2policy --watch --dry-run   # preview selected policies on stdout
 
 The tool accepts Hubble flows in two formats:
 
-- **Flat flow objects** -- the standard JSONL output from `hubble observe -o json`, where each line is a flow dict with `source`, `destination`, `l4`, etc. at the top level.
-- **Envelope format** (`{"flow": {...}}`) -- used by Hubble dynamic exports configured via the Cilium configmap (`hubble.export.*`). The envelope is automatically unwrapped.
+- **Flat flow objects**: the standard JSONL output from `hubble observe -o json`, where each line is a flow dict with `source`, `destination`, `l4`, etc. at the top level.
+- **Envelope format** (`{"flow": {...}}`): used by Hubble dynamic exports configured via the Cilium configmap (`hubble.export.*`). The envelope is automatically unwrapped.
 
 Both formats work with all backends (file, Loki, live watch).
 
@@ -262,4 +274,4 @@ hubble-audit2policy [-h] [-o OUTPUT_DIR] [-n NAMESPACE]
 
 ## License
 
-Apache-2.0 -- see [LICENSE](LICENSE) for details.
+Apache-2.0. See [LICENSE](LICENSE) for details.
