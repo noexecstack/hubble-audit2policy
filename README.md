@@ -2,7 +2,7 @@
 
 Generate least-privilege [CiliumNetworkPolicy](https://docs.cilium.io/en/stable/security/policy/) YAML from real observed traffic. No enterprise license required.
 
-![Flow report TUI showing observed connections from Loki](tui-flow-report.png)
+![Flow report TUI showing observed connections from Loki](https://raw.githubusercontent.com/noexecstack/hubble-audit2policy/main/tui-flow-report.png)
 
 ## Why this exists
 
